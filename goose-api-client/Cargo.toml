@@ -1,0 +1,18 @@
+[package]
+name = "goose-api-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures.workspace = true
+progenitor-client.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+goose-api.workspace = true
+prettyplease.workspace = true
+progenitor.workspace = true
+serde_json.workspace = true
+syn.workspace = true
