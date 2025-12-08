@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+comfy-table.workspace = true
+directories.workspace = true
 goose-api.workspace = true
 goose-api-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
