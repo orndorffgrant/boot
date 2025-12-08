@@ -1,6 +1,6 @@
 use anyhow::Ok;
 use clap::{Args, Parser, Subcommand};
-use comfy_table::{Table, presets::NOTHING};
+use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
 use goose_api_client;
 
 mod server_config;
@@ -120,15 +120,60 @@ async fn add_server(args: AddServerArgs) -> anyhow::Result<()> {
     config.add_server(args.name.clone(), args.host.clone(), args.port)?;
     config.save()?;
     
-    println!("Added server '{}' at {}:{}", args.name, args.host, args.port);
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    
+    for server in config.list_servers() {
+        if server.name == args.name {
+            // Bold the newly added server
+            table.add_row(vec![
+                Cell::new(&server.name).add_attribute(Attribute::Bold),
+                Cell::new(&server.host).add_attribute(Attribute::Bold),
+                Cell::new(server.port.to_string()).add_attribute(Attribute::Bold),
+            ]);
+        } else {
+            table.add_row(vec![&server.name, &server.host, &server.port.to_string()]);
+        }
+    }
+    
+    println!("{table}");
     Ok(())
 }
 
 async fn remove_server(args: RemoveServerArgs) -> anyhow::Result<()> {
-    let mut config = server_config::ServerConfig::load()?;
+    let config = server_config::ServerConfig::load()?;
+    
+    // Check if server exists before removal
+    let server_to_remove = config.list_servers().iter()
+        .find(|s| s.name == args.name)
+        .cloned();
+    
+    if server_to_remove.is_none() {
+        anyhow::bail!("Server '{}' not found", args.name);
+    }
+    
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    
+    for server in config.list_servers() {
+        if server.name == args.name {
+            // Strikethrough the server being removed
+            table.add_row(vec![
+                Cell::new(&server.name).add_attribute(Attribute::CrossedOut),
+                Cell::new(&server.host).add_attribute(Attribute::CrossedOut),
+                Cell::new(server.port.to_string()).add_attribute(Attribute::CrossedOut),
+            ]);
+        } else {
+            table.add_row(vec![&server.name, &server.host, &server.port.to_string()]);
+        }
+    }
+    
+    println!("{table}");
+    
+    // Now actually remove and save
+    let mut config = config;
     config.remove_server(&args.name)?;
     config.save()?;
     
-    println!("Removed server '{}'", args.name);
     Ok(())
 }
