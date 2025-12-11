@@ -20,7 +20,7 @@ enum Command {
     #[command(name = "stop-server")]
     StopServer,
     #[command(name = "run-server")]
-    RunServer,
+    RunServer(RunServerArgs),
     #[command(name = "api-desc")]
     APIDesc,
     #[command(name = "list-programmers")]
@@ -34,14 +34,18 @@ enum Command {
 }
 
 #[derive(Args)]
+struct RunServerArgs {
+    /// Port to run the server on (defaults to 46673)
+    #[arg(short, long)]
+    port: Option<u16>,
+}
+
+#[derive(Args)]
 struct AddServerArgs {
     /// Name of the server
     name: String,
-    /// Host address
-    host: String,
-    /// Port number (defaults to 46673)
-    #[arg(short, long, default_value = "46673")]
-    port: u16,
+    /// Connection URL (e.g., http://localhost:46673)
+    url: String,
 }
 
 #[derive(Args)]
@@ -56,30 +60,82 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::StartServer => start_server().await,
         Command::StopServer => stop_server().await,
-        Command::RunServer => run_server().await,
+        Command::RunServer(args) => run_server(args).await,
         Command::APIDesc => api_desc().await,
         Command::ListServers => list_servers().await,
         Command::AddServer(args) => add_server(args).await,
         Command::RemoveServer(args) => remove_server(args).await,
-        api_dependent_cmd => {
-            systemd_service::start_service_if_needed()?;
-            let client = goose_api_client::Client::new("http://localhost:46673");
-            match api_dependent_cmd {
-                Command::ListProgrammers => list_programmers(client).await,
-                _ => unreachable!(),
-            }
-        },
+        Command::ListProgrammers => list_programmers().await,
     }
 }
 
+fn print_servers_table(servers: &[server_config::Server], highlight_name: Option<&str>, highlight_style: Option<Attribute>) {
+    if servers.is_empty() {
+        println!("No servers configured.");
+        return;
+    }
+    
+    let mut table = Table::new();
+    table.load_preset(NOTHING);
+    
+    for server in servers {
+        if let Some(name) = highlight_name {
+            if server.name == name {
+                if let Some(style) = highlight_style {
+                    table.add_row(vec![
+                        Cell::new(&server.name).add_attribute(style),
+                        Cell::new(&server.url).add_attribute(style),
+                    ]);
+                    continue;
+                }
+            }
+        }
+        table.add_row(vec![&server.name, &server.url]);
+    }
+    
+    println!("{table}");
+}
+
 async fn start_server() -> anyhow::Result<()> {
-    systemd_service::start_service()
+    systemd_service::start_service()?;
+    
+    // Add local server to the servers list
+    let mut config = server_config::ServerConfig::load()?;
+    
+    // Remove existing "local" entry if it exists
+    config.servers.retain(|s| s.name != "local");
+    
+    // Add the local server
+    config.add_server("local".to_string(), "http://localhost:46673".to_string())?;
+    config.save()?;
+    
+    // Display the updated servers list with the new local server in bold
+    print_servers_table(config.list_servers(), Some("local"), Some(Attribute::Bold));
+    Ok(())
 }
+
 async fn stop_server() -> anyhow::Result<()> {
-    systemd_service::stop_service()
+    systemd_service::stop_service()?;
+    
+    // Remove local server from the servers list
+    let mut config = server_config::ServerConfig::load()?;
+    
+    // Check if local server exists
+    let local_exists = config.list_servers().iter().any(|s| s.name == "local");
+    
+    if local_exists {
+        // Display the servers list with local crossed out before removal
+        print_servers_table(config.list_servers(), Some("local"), Some(Attribute::CrossedOut));
+        
+        // Now remove the local server
+        config.remove_server("local")?;
+        config.save()?;
+    }
+    
+    Ok(())
 }
-async fn run_server() -> anyhow::Result<()> {
-    goose_api::run().await
+async fn run_server(args: RunServerArgs) -> anyhow::Result<()> {
+    goose_api::run(args.port).await
 }
 
 async fn api_desc() -> anyhow::Result<()> {
@@ -88,13 +144,7 @@ async fn api_desc() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_programmers(client: goose_api_client::Client) -> anyhow::Result<()> {
-    let response = client.programmers().await?;
-    println!("response: {:?}", response);
-    Ok(())
-}
-
-async fn list_servers() -> anyhow::Result<()> {
+async fn list_programmers() -> anyhow::Result<()> {
     let config = server_config::ServerConfig::load()?;
     let servers = config.list_servers();
     
@@ -107,36 +157,51 @@ async fn list_servers() -> anyhow::Result<()> {
     table.load_preset(NOTHING);
     
     for server in servers {
-        table.add_row(vec![&server.name, &server.host, &server.port.to_string()]);
+        let client = goose_api_client::Client::new(&server.url);
+        match client.programmers().await {
+            std::result::Result::Ok(response) => {
+                let programmers = response.into_inner();
+                // Skip if no programmers found
+                if !programmers.is_empty() {
+                    for programmer in programmers {
+                        let info = format!(
+                            "{} - {} (VID: 0x{:04x}, PID: 0x{:04x}){}",
+                            programmer.name,
+                            programmer.probe_type,
+                            programmer.vendor_id,
+                            programmer.product_id,
+                            programmer.serial_number
+                                .as_ref()
+                                .map(|s| format!(" [{}]", s))
+                                .unwrap_or_default()
+                        );
+                        table.add_row(vec![&server.name, &info]);
+                    }
+                }
+            }
+            std::result::Result::Err(e) => {
+                // Print errors to stderr
+                eprintln!("Error connecting to server '{}' ({}): {}", server.name, server.url, e);
+            }
+        }
     }
     
     println!("{table}");
-    
+    Ok(())
+}
+
+async fn list_servers() -> anyhow::Result<()> {
+    let config = server_config::ServerConfig::load()?;
+    print_servers_table(config.list_servers(), None, None);
     Ok(())
 }
 
 async fn add_server(args: AddServerArgs) -> anyhow::Result<()> {
     let mut config = server_config::ServerConfig::load()?;
-    config.add_server(args.name.clone(), args.host.clone(), args.port)?;
+    config.add_server(args.name.clone(), args.url.clone())?;
     config.save()?;
     
-    let mut table = Table::new();
-    table.load_preset(NOTHING);
-    
-    for server in config.list_servers() {
-        if server.name == args.name {
-            // Bold the newly added server
-            table.add_row(vec![
-                Cell::new(&server.name).add_attribute(Attribute::Bold),
-                Cell::new(&server.host).add_attribute(Attribute::Bold),
-                Cell::new(server.port.to_string()).add_attribute(Attribute::Bold),
-            ]);
-        } else {
-            table.add_row(vec![&server.name, &server.host, &server.port.to_string()]);
-        }
-    }
-    
-    println!("{table}");
+    print_servers_table(config.list_servers(), Some(&args.name), Some(Attribute::Bold));
     Ok(())
 }
 
@@ -144,31 +209,12 @@ async fn remove_server(args: RemoveServerArgs) -> anyhow::Result<()> {
     let config = server_config::ServerConfig::load()?;
     
     // Check if server exists before removal
-    let server_to_remove = config.list_servers().iter()
-        .find(|s| s.name == args.name)
-        .cloned();
-    
-    if server_to_remove.is_none() {
+    if !config.list_servers().iter().any(|s| s.name == args.name) {
         anyhow::bail!("Server '{}' not found", args.name);
     }
     
-    let mut table = Table::new();
-    table.load_preset(NOTHING);
-    
-    for server in config.list_servers() {
-        if server.name == args.name {
-            // Strikethrough the server being removed
-            table.add_row(vec![
-                Cell::new(&server.name).add_attribute(Attribute::CrossedOut),
-                Cell::new(&server.host).add_attribute(Attribute::CrossedOut),
-                Cell::new(server.port.to_string()).add_attribute(Attribute::CrossedOut),
-            ]);
-        } else {
-            table.add_row(vec![&server.name, &server.host, &server.port.to_string()]);
-        }
-    }
-    
-    println!("{table}");
+    // Display the servers list with the server being removed crossed out
+    print_servers_table(config.list_servers(), Some(&args.name), Some(Attribute::CrossedOut));
     
     // Now actually remove and save
     let mut config = config;

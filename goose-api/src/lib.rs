@@ -78,14 +78,17 @@ impl GooseApi for ServerImpl {
     }
 }
 
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(port: Option<u16>) -> anyhow::Result<()> {
+    let port = port.unwrap_or(46673);
+    let bind_address = format!("127.0.0.1:{}", port);
+    
     let log = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,
     }
     .to_logger("goose-api")?;
     
     let api = goose_api_mod::api_description::<ServerImpl>().unwrap();
-    let server = ServerBuilder::new(api, (), log).config(ConfigDropshot{bind_address: "127.0.0.1:46673".parse().unwrap(), ..Default::default()}).start()?;
+    let server = ServerBuilder::new(api, (), log).config(ConfigDropshot{bind_address: bind_address.parse().unwrap(), ..Default::default()}).start()?;
     server.await.map_err(|e| anyhow::Error::msg(e))
 }
 

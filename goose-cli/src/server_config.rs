@@ -7,8 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub name: String,
-    pub host: String,
-    pub port: u16,
+    pub url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,12 +56,12 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub fn add_server(&mut self, name: String, host: String, port: u16) -> Result<()> {
+    pub fn add_server(&mut self, name: String, url: String) -> Result<()> {
         if self.servers.iter().any(|s| s.name == name) {
             anyhow::bail!("Server with name '{}' already exists", name);
         }
 
-        self.servers.push(Server { name, host, port });
+        self.servers.push(Server { name, url });
         Ok(())
     }
 
