@@ -1,5 +1,5 @@
 [package]
-name = "goose-api-client"
+name = "boot-api-client"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,7 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [build-dependencies]
-goose-api.workspace = true
+boot-api.workspace = true
 prettyplease.workspace = true
 progenitor.workspace = true
 serde_json.workspace = true

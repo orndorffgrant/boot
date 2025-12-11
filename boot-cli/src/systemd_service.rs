@@ -6,12 +6,12 @@ pub fn start_service() -> Result<()> {
     let current_exe = env::current_exe()
         .context("Failed to get current executable path")?;
     
-    let service_name = "goose-api";
+    let service_name = "boot-api";
     
     let output = Command::new("systemd-run")
         .args([
             "--unit", service_name,
-            "--description", "Goose API Service",
+            "--description", "Boot API Service",
             "--service-type", "exec",
             current_exe.to_str().unwrap(),
             "run-server"
@@ -29,7 +29,7 @@ pub fn start_service() -> Result<()> {
 
 
 pub fn stop_service() -> Result<()> {
-    let service_name = "goose-api";
+    let service_name = "boot-api";
     
     let output = Command::new("systemctl")
         .args(["stop", service_name])
@@ -45,7 +45,7 @@ pub fn stop_service() -> Result<()> {
 }
 
 pub fn start_service_if_needed() -> Result<()> {
-    let service_name = "goose-api";
+    let service_name = "boot-api";
     
     if is_service_active(service_name)? {
         return Ok(());
@@ -66,7 +66,7 @@ fn is_service_active(service_name: &str) -> Result<bool> {
 }
 
 fn wait_until_service_active() -> Result<()> {
-    let service_name = "goose-api";
+    let service_name = "boot-api";
     
     loop {
         if is_service_active(service_name)? {

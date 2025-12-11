@@ -234,6 +234,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dropshot",
+ "http",
+ "probe-rs",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "boot-api-client"
+version = "0.1.0"
+dependencies = [
+ "boot-api",
+ "futures",
+ "prettyplease",
+ "progenitor",
+ "progenitor-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
+name = "boot-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boot-api",
+ "boot-api-client",
+ "clap",
+ "comfy-table",
+ "directories",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,50 +1065,6 @@ dependencies = [
  "fallible-iterator",
  "indexmap",
  "stable_deref_trait",
-]
-
-[[package]]
-name = "goose-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dropshot",
- "http",
- "probe-rs",
- "schemars",
- "semver",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "goose-api-client"
-version = "0.1.0"
-dependencies = [
- "futures",
- "goose-api",
- "prettyplease",
- "progenitor",
- "progenitor-client",
- "reqwest",
- "serde",
- "serde_json",
- "syn",
-]
-
-[[package]]
-name = "goose-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "directories",
- "goose-api",
- "goose-api-client",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

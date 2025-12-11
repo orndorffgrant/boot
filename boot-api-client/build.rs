@@ -1,5 +1,5 @@
 fn main() {
-    let openapistr = goose_api::openapi();
+    let openapistr = boot_api::openapi();
     let spec = serde_json::from_str(&openapistr).unwrap();
     let mut generator = progenitor::Generator::default();
 

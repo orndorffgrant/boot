@@ -17,7 +17,7 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     fn config_path() -> Result<PathBuf> {
-        let proj_dirs = ProjectDirs::from("", "", "goose")
+        let proj_dirs = ProjectDirs::from("", "", "boot")
             .context("Failed to determine project directories")?;
         
         let config_dir = proj_dirs.data_dir();

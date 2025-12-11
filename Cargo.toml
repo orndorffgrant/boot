@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "goose-api",
-    "goose-api-client",
-    "goose-cli",
+    "boot-api",
+    "boot-api-client",
+    "boot-cli",
 ]
 
 [workspace.dependencies]
@@ -28,5 +28,5 @@ syn = "2.0"
 tokio = "1.48"
 
 # Workspace crates
-goose-api = { path = "goose-api" }
-goose-api-client = { path = "goose-api-client" }
+boot-api = { path = "boot-api" }
+boot-api-client = { path = "boot-api-client" }

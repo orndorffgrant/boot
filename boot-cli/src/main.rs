@@ -1,13 +1,13 @@
 use anyhow::Ok;
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
-use goose_api_client;
+use boot_api_client;
 
 mod server_config;
 mod systemd_service;
 
 #[derive(Parser)]
-#[command(name = "goose")]
+#[command(name = "boot")]
 struct CLI {
     #[command(subcommand)]
     command: Command,
@@ -135,11 +135,11 @@ async fn stop_server() -> anyhow::Result<()> {
     Ok(())
 }
 async fn run_server(args: RunServerArgs) -> anyhow::Result<()> {
-    goose_api::run(args.port).await
+    boot_api::run(args.port).await
 }
 
 async fn api_desc() -> anyhow::Result<()> {
-    let openapi = goose_api::openapi();
+    let openapi = boot_api::openapi();
     println!("{}", openapi);
     Ok(())
 }
@@ -157,7 +157,7 @@ async fn list_programmers() -> anyhow::Result<()> {
     table.load_preset(NOTHING);
     
     for server in servers {
-        let client = goose_api_client::Client::new(&server.url);
+        let client = boot_api_client::Client::new(&server.url);
         match client.programmers().await {
             std::result::Result::Ok(response) => {
                 let programmers = response.into_inner();

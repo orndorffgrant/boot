@@ -26,7 +26,7 @@ struct Programmer {
 
 /// Defines the trait that captures all the methods.
 #[dropshot::api_description]
-trait GooseApi {
+trait BootApi {
     /// The context type used within endpoints.
     type Context;
 
@@ -49,7 +49,7 @@ trait GooseApi {
 
 enum ServerImpl {}
 
-impl GooseApi for ServerImpl {
+impl BootApi for ServerImpl {
     type Context = ();
 
     async fn health(
@@ -85,17 +85,17 @@ pub async fn run(port: Option<u16>) -> anyhow::Result<()> {
     let log = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,
     }
-    .to_logger("goose-api")?;
+    .to_logger("boot-api")?;
     
-    let api = goose_api_mod::api_description::<ServerImpl>().unwrap();
+    let api = boot_api_mod::api_description::<ServerImpl>().unwrap();
     let server = ServerBuilder::new(api, (), log).config(ConfigDropshot{bind_address: bind_address.parse().unwrap(), ..Default::default()}).start()?;
     server.await.map_err(|e| anyhow::Error::msg(e))
 }
 
 pub fn openapi() -> String {
-    let description = goose_api_mod::stub_api_description().unwrap();
+    let description = boot_api_mod::stub_api_description().unwrap();
     let openapi = description
-        .openapi("Goose API", semver::Version::new(1, 0, 0));
+        .openapi("Boot API", semver::Version::new(1, 0, 0));
     let json = openapi.json().unwrap();
     serde_json::to_string(&json).unwrap()
 }
