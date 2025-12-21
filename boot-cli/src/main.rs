@@ -16,7 +16,7 @@ struct CLI {
 #[derive(Subcommand)]
 enum Command {
     #[command(name = "start-server")]
-    StartServer,
+    StartServer(StartServerArgs),
     #[command(name = "stop-server")]
     StopServer,
     #[command(name = "run-server")]
@@ -34,10 +34,20 @@ enum Command {
 }
 
 #[derive(Args)]
+struct StartServerArgs {
+    /// Host to listen on (defaults to 127.0.0.1)
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(Args)]
 struct RunServerArgs {
     /// Port to run the server on (defaults to 46673)
     #[arg(short, long)]
     port: Option<u16>,
+    /// Host to listen on (defaults to 127.0.0.1)
+    #[arg(long)]
+    host: Option<String>,
 }
 
 #[derive(Args)]
@@ -58,7 +68,7 @@ struct RemoveServerArgs {
 async fn main() -> anyhow::Result<()> {
     let cli = CLI::parse();
     match cli.command {
-        Command::StartServer => start_server().await,
+        Command::StartServer(args) => start_server(args).await,
         Command::StopServer => stop_server().await,
         Command::RunServer(args) => run_server(args).await,
         Command::APIDesc => api_desc().await,
@@ -96,8 +106,9 @@ fn print_servers_table(servers: &[server_config::Server], highlight_name: Option
     println!("{table}");
 }
 
-async fn start_server() -> anyhow::Result<()> {
-    systemd_service::start_service()?;
+async fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
+    let host = args.host.as_deref().unwrap_or("127.0.0.1");
+    systemd_service::start_service(host)?;
     
     // Add local server to the servers list
     let mut config = server_config::ServerConfig::load()?;
@@ -105,8 +116,16 @@ async fn start_server() -> anyhow::Result<()> {
     // Remove existing "local" entry if it exists
     config.servers.retain(|s| s.name != "local");
     
+    // Determine the URL based on the host
+    let url = if host == "0.0.0.0" {
+        // If listening on all interfaces, use localhost for client connection
+        "http://localhost:46673".to_string()
+    } else {
+        format!("http://{}:46673", host)
+    };
+    
     // Add the local server
-    config.add_server("local".to_string(), "http://localhost:46673".to_string())?;
+    config.add_server("local".to_string(), url)?;
     config.save()?;
     
     // Display the updated servers list with the new local server in bold
@@ -135,7 +154,7 @@ async fn stop_server() -> anyhow::Result<()> {
     Ok(())
 }
 async fn run_server(args: RunServerArgs) -> anyhow::Result<()> {
-    boot_api::run(args.port).await
+    boot_api::run(args.port, args.host).await
 }
 
 async fn api_desc() -> anyhow::Result<()> {

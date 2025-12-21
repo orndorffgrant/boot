@@ -86,9 +86,10 @@ impl BootApi for ServerImpl {
     }
 }
 
-pub async fn run(port: Option<u16>) -> anyhow::Result<()> {
+pub async fn run(port: Option<u16>, host: Option<String>) -> anyhow::Result<()> {
     let port = port.unwrap_or(46673);
-    let bind_address = format!("127.0.0.1:{}", port);
+    let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_address = format!("{}:{}", host, port);
     
     let log = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,

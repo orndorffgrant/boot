@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::env;
 use std::process::Command;
 
-pub fn start_service() -> Result<()> {
+pub fn start_service(host: &str) -> Result<()> {
     let current_exe = env::current_exe()
         .context("Failed to get current executable path")?;
     
@@ -14,7 +14,9 @@ pub fn start_service() -> Result<()> {
             "--description", "Boot API Service",
             "--service-type", "exec",
             current_exe.to_str().unwrap(),
-            "run-server"
+            "run-server",
+            "--host",
+            host,
         ])
         .output()
         .context("Failed to execute systemd-run command")?;
@@ -50,7 +52,7 @@ pub fn start_service_if_needed() -> Result<()> {
     if is_service_active(service_name)? {
         return Ok(());
     }
-    start_service()?;
+    start_service(&"127.0.0.1")?;
     wait_until_service_active()?;
     
     Ok(())
