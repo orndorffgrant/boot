@@ -11,7 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [build-dependencies]
-boot-api.workspace = true
+boot-api = { workspace = true, default-features = false }
 prettyplease.workspace = true
 progenitor.workspace = true
 serde_json.workspace = true

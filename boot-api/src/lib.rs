@@ -7,6 +7,7 @@ use dropshot::RequestContext;
 use dropshot::ServerBuilder;
 use schemars::JsonSchema;
 use serde::Serialize;
+#[cfg(feature = "probe-rs-support")]
 use probe_rs::probe;
 
 #[derive(Serialize, JsonSchema)]
@@ -61,20 +62,27 @@ impl BootApi for ServerImpl {
     async fn programmers(
         _rqctx: RequestContext<Self::Context>,
     ) -> Result<HttpResponseOk<Vec<Programmer>>, HttpError> {
-        let lister = probe::list::Lister::new();
-        let probes = lister.list_all();
-        let programmers = probes.iter().map(|probe| {
-            Programmer {
-                id: "TODO".to_string(),
-                name: probe.identifier.clone(),
-                vendor_id: probe.vendor_id,
-                product_id: probe.product_id,
-                serial_number: probe.serial_number.clone(),
-                hid_interface: probe.hid_interface,
-                probe_type: probe.probe_type(),
-            }
-        }).collect();
-        Ok(HttpResponseOk(programmers))
+        #[cfg(feature = "probe-rs-support")]
+        {
+            let lister = probe::list::Lister::new();
+            let probes = lister.list_all();
+            let programmers = probes.iter().map(|probe| {
+                Programmer {
+                    id: "TODO".to_string(),
+                    name: probe.identifier.clone(),
+                    vendor_id: probe.vendor_id,
+                    product_id: probe.product_id,
+                    serial_number: probe.serial_number.clone(),
+                    hid_interface: probe.hid_interface,
+                    probe_type: probe.probe_type(),
+                }
+            }).collect();
+            Ok(HttpResponseOk(programmers))
+        }
+        #[cfg(not(feature = "probe-rs-support"))]
+        {
+            Err(HttpError::for_unavail(None, "probe-rs support not compiled in".to_string()))
+        }
     }
 }
 

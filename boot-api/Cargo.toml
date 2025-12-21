@@ -7,8 +7,12 @@ edition = "2024"
 anyhow.workspace = true
 dropshot.workspace = true
 http.workspace = true
-probe-rs.workspace = true
+probe-rs = { workspace = true, optional = true }
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+default = ["probe-rs-support"]
+probe-rs-support = ["probe-rs"]
