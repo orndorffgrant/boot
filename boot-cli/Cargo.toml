@@ -8,7 +8,7 @@ anyhow.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
 directories.workspace = true
-boot-api = { workspace = true, features = ["probe-rs-support"] }
+boot-api = { workspace = true, features = ["run"] }
 boot-api-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true

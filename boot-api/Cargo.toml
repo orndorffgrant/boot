@@ -14,5 +14,5 @@ serde.workspace = true
 serde_json.workspace = true
 
 [features]
-default = ["probe-rs-support"]
-probe-rs-support = ["probe-rs"]
+default = ["run"]
+run = ["probe-rs"]
