@@ -38,16 +38,19 @@ struct StartServerArgs {
     /// Host to listen on (defaults to 127.0.0.1)
     #[arg(long)]
     host: Option<String>,
+    /// Port to run the server on (defaults to 46673)
+    #[arg(short, long)]
+    port: Option<u16>,
 }
 
 #[derive(Args)]
 struct RunServerArgs {
-    /// Port to run the server on (defaults to 46673)
-    #[arg(short, long)]
-    port: Option<u16>,
     /// Host to listen on (defaults to 127.0.0.1)
     #[arg(long)]
     host: Option<String>,
+    /// Port to run the server on (defaults to 46673)
+    #[arg(short, long)]
+    port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -107,8 +110,9 @@ fn print_servers_table(servers: &[server_config::Server], highlight_name: Option
 }
 
 async fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
-    let host = args.host.as_deref().unwrap_or("127.0.0.1");
-    systemd_service::start_service(host)?;
+    let host = args.host.clone().unwrap_or("localhost".to_string());
+    let port = args.port.clone().unwrap_or(46673);
+    systemd_service::start_service(args.host, args.port)?;
     
     // Add local server to the servers list
     let mut config = server_config::ServerConfig::load()?;
@@ -117,11 +121,11 @@ async fn start_server(args: StartServerArgs) -> anyhow::Result<()> {
     config.servers.retain(|s| s.name != "local");
     
     // Determine the URL based on the host
-    let url = if host == "0.0.0.0" {
+    let url = if host == "0.0.0.0".to_string() {
         // If listening on all interfaces, use localhost for client connection
-        "http://localhost:46673".to_string()
+        format!("http://localhost:{}", port)
     } else {
-        format!("http://{}:46673", host)
+        format!("http://{}:{}", host, port)
     };
     
     // Add the local server
@@ -154,7 +158,7 @@ async fn stop_server() -> anyhow::Result<()> {
     Ok(())
 }
 async fn run_server(args: RunServerArgs) -> anyhow::Result<()> {
-    boot_api::run(args.port, args.host).await
+    boot_api::run(args.host, args.port).await
 }
 
 async fn api_desc() -> anyhow::Result<()> {
