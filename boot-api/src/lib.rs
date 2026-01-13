@@ -16,7 +16,7 @@ struct Empty {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct Programmer {
+struct Probe {
     pub id: String,
     pub name: String,
     pub vendor_id: u16,
@@ -57,24 +57,24 @@ trait BootApi {
     
     #[endpoint {
         method = GET,
-        path = "/v1/programmers",
+        path = "/v1/probes",
     }]
-    async fn programmers(
+    async fn probes(
         rqctx: RequestContext<Self::Context>,
-    ) -> Result<HttpResponseOk<Vec<Programmer>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<Probe>>, HttpError>;
 
     #[endpoint {
         method = GET,
-        path = "/v1/programmers/{selector}/target",
+        path = "/v1/probes/{selector}/target",
     }]
-    async fn programmers_target(
+    async fn probes_target(
         rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
     ) -> Result<HttpResponseOk<Target>, HttpError>;
 
     #[endpoint {
         method = POST,
-        path = "/v1/programmers/{selector}",
+        path = "/v1/probes/{selector}",
         request_body_max_bytes = 10485760, // 10 MB for ELF files
     }]
     async fn flash_and_run(

@@ -4,7 +4,7 @@ use probe_rs::probe;
 use probe_rs::flashing;
 use base64::prelude::*;
 
-use crate::{BootApi, Empty, Programmer, Target, SelectorPath, FlashRequest};
+use crate::{BootApi, Empty, Probe, Target, SelectorPath, FlashRequest};
 
 enum ServerImpl {}
 
@@ -17,13 +17,13 @@ impl BootApi for ServerImpl {
         Ok(HttpResponseOk(Empty{}))
     }
 
-    async fn programmers(
+    async fn probes(
         _rqctx: RequestContext<Self::Context>,
-    ) -> Result<HttpResponseOk<Vec<Programmer>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<Probe>>, HttpError> {
         let lister = probe::list::Lister::new();
-        let probes = lister.list_all();
-        let programmers = probes.iter().map(|probe| {
-            Programmer {
+        let probes_list = lister.list_all();
+        let probes = probes_list.iter().map(|probe| {
+            Probe {
                 id: "TODO".to_string(),
                 name: probe.identifier.clone(),
                 vendor_id: probe.vendor_id,
@@ -33,10 +33,10 @@ impl BootApi for ServerImpl {
                 probe_type: probe.probe_type(),
             }
         }).collect();
-        Ok(HttpResponseOk(programmers))
+        Ok(HttpResponseOk(probes))
     }
 
-    async fn programmers_target(
+    async fn probes_target(
         _rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
     ) -> Result<HttpResponseOk<Target>, HttpError> {

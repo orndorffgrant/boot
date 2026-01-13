@@ -25,8 +25,8 @@ enum Command {
     RunServer(RunServerArgs),
     #[command(name = "api-desc")]
     APIDesc,
-    #[command(name = "list-programmers")]
-    ListProgrammers,
+    #[command(name = "list-probes")]
+    ListProbes,
     #[command(name = "list-servers")]
     ListServers,
     #[command(name = "add-server")]
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ListServers => list_servers().await,
         Command::AddServer(args) => add_server(args).await,
         Command::RemoveServer(args) => remove_server(args).await,
-        Command::ListProgrammers => list_programmers().await,
+        Command::ListProbes => list_probes().await,
         Command::Run(args) => run(args).await,
     }
 }
@@ -179,7 +179,7 @@ async fn api_desc() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_programmers() -> anyhow::Result<()> {
+async fn list_probes() -> anyhow::Result<()> {
     let config = server_config::ServerConfig::load()?;
     let servers = config.list_servers();
     
@@ -193,22 +193,22 @@ async fn list_programmers() -> anyhow::Result<()> {
     
     for server in servers {
         let client = boot_api_client::Client::new(&server.url);
-        match client.programmers().await {
+        match client.probes().await {
             std::result::Result::Ok(response) => {
-                let programmers = response.into_inner();
-                // Skip if no programmers found
-                if !programmers.is_empty() {
-                    for programmer in programmers {
+                let probes = response.into_inner();
+                // Skip if no probes found
+                if !probes.is_empty() {
+                    for probe in probes {
                         let selector = format!(
                             "{:04x}:{:04x}:{}",
-                            programmer.vendor_id,
-                            programmer.product_id,
-                            programmer.serial_number
+                            probe.vendor_id,
+                            probe.product_id,
+                            probe.serial_number
                                 .as_ref()
                                 .map(|s| format!("{}", s))
                                 .unwrap_or_default()
                         );
-                        table.add_row(vec![&server.name, &selector, &programmer.name]);
+                        table.add_row(vec![&server.name, &selector, &probe.name]);
                     }
                 }
             }
