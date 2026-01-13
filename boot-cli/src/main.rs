@@ -1,6 +1,8 @@
 use anyhow::Ok;
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
+use indicatif::{ProgressBar, ProgressStyle};
 use boot_api_client;
 
 mod server_config;
@@ -31,6 +33,7 @@ enum Command {
     AddServer(AddServerArgs),
     #[command(name = "remove-server")]
     RemoveServer(RemoveServerArgs),
+    Run(RunArgs),
 }
 
 #[derive(Args)]
@@ -67,6 +70,14 @@ struct RemoveServerArgs {
     name: String,
 }
 
+#[derive(Args)]
+struct RunArgs {
+    /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
+    server_and_selector: String,
+    /// Path to the ELF file
+    elf_path: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CLI::parse();
@@ -79,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AddServer(args) => add_server(args).await,
         Command::RemoveServer(args) => remove_server(args).await,
         Command::ListProgrammers => list_programmers().await,
+        Command::Run(args) => run(args).await,
     }
 }
 
@@ -187,18 +199,16 @@ async fn list_programmers() -> anyhow::Result<()> {
                 // Skip if no programmers found
                 if !programmers.is_empty() {
                     for programmer in programmers {
-                        let info = format!(
-                            "{} - {} (VID: 0x{:04x}, PID: 0x{:04x}){}",
-                            programmer.name,
-                            programmer.probe_type,
+                        let selector = format!(
+                            "{:04x}:{:04x}:{}",
                             programmer.vendor_id,
                             programmer.product_id,
                             programmer.serial_number
                                 .as_ref()
-                                .map(|s| format!(" [{}]", s))
+                                .map(|s| format!("{}", s))
                                 .unwrap_or_default()
                         );
-                        table.add_row(vec![&server.name, &info]);
+                        table.add_row(vec![&server.name, &selector, &programmer.name]);
                     }
                 }
             }
@@ -243,6 +253,81 @@ async fn remove_server(args: RemoveServerArgs) -> anyhow::Result<()> {
     let mut config = config;
     config.remove_server(&args.name)?;
     config.save()?;
+    
+    Ok(())
+}
+
+async fn run(args: RunArgs) -> anyhow::Result<()> {
+    // Parse server name and selector
+    let parts: Vec<&str> = args.server_and_selector.split('/').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Invalid format. Expected {{server-name}}/{{debugprobeselector}}");
+    }
+    let server_name = parts[0];
+    let selector = parts[1];
+    
+    // Load server configuration
+    let config = server_config::ServerConfig::load()?;
+    let server = config.list_servers()
+        .iter()
+        .find(|s| s.name == server_name)
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+    
+    // Create spinner for reading file
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+    );
+    spinner.set_message(format!("Reading {}...", args.elf_path));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    
+    // Read ELF file
+    let elf_bytes = std::fs::read(&args.elf_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read ELF file '{}': {}", args.elf_path, e))?;
+    
+    spinner.finish_with_message(format!("Read {} ({} bytes)", args.elf_path, elf_bytes.len()));
+    
+    // Create spinner for encoding
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+    );
+    spinner.set_message("Encoding to base64...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    
+    // Encode to base64
+    let elf_data = base64::prelude::BASE64_STANDARD.encode(&elf_bytes);
+    
+    spinner.finish_and_clear();
+    
+    // Create client with longer timeout for large file transfers
+    let reqwest_client = reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let client = boot_api_client::Client::new_with_client(&server.url, reqwest_client);
+    
+    // Create spinner for flashing
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap()
+    );
+    spinner.set_message(format!("Flashing to {} via {}...", selector, server_name));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    
+    client.flash_and_run(selector, &boot_api_client::types::FlashRequest { elf_data })
+        .await
+        .map_err(|e| {
+            spinner.finish_and_clear();
+            anyhow::anyhow!("Failed to flash firmware: {:#}", e)
+        })?;
+    
+    spinner.finish_with_message(format!("✓ Successfully flashed and started firmware on {}", selector));
     
     Ok(())
 }

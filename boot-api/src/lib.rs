@@ -1,8 +1,10 @@
 use dropshot::HttpError;
 use dropshot::HttpResponseOk;
 use dropshot::RequestContext;
+use dropshot::Path;
+use dropshot::TypedBody;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 #[cfg(feature = "run")]
 mod run;
@@ -22,6 +24,21 @@ struct Programmer {
     pub serial_number: Option<String>,
     pub hid_interface: Option<u8>,
     pub probe_type: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Target {
+    pub name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SelectorPath {
+    pub selector: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FlashRequest {
+    pub elf_data: String,
 }
 
 /// Defines the trait that captures all the methods.
@@ -45,6 +62,26 @@ trait BootApi {
     async fn programmers(
         rqctx: RequestContext<Self::Context>,
     ) -> Result<HttpResponseOk<Vec<Programmer>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/programmers/{selector}/target",
+    }]
+    async fn programmers_target(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+    ) -> Result<HttpResponseOk<Target>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/programmers/{selector}",
+        request_body_max_bytes = 10485760, // 10 MB for ELF files
+    }]
+    async fn flash_and_run(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+        body: TypedBody<FlashRequest>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError>;
 }
 
 
