@@ -13,7 +13,11 @@ schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serialport = { workspace = true, optional = true }
+tokio.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
+futures.workspace = true
 
 [features]
 default = ["run"]
-run = ["probe-rs", "base64"]
+run = ["probe-rs", "base64", "serialport", "tokio-tungstenite"]

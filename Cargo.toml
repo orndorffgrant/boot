@@ -21,13 +21,16 @@ progenitor = "0.11"
 progenitor-client = "0.11"
 prettyplease = "0.2"
 probe-rs = "0.30"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 schemars = "0.8"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serialport = "4.5"
 syn = "2.0"
-tokio = "1.48"
+tokio = { version = "1.48", features = ["full"] }
+tokio-tungstenite = "0.24"
 
 # Workspace crates
 boot-api = { path = "boot-api", default-features = false }

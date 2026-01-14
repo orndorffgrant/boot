@@ -4,8 +4,10 @@ version = "2026.1.0"
 edition = "2024"
 
 [dependencies]
+base64.workspace = true
 futures.workspace = true
 progenitor-client.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

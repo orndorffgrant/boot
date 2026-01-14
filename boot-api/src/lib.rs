@@ -3,6 +3,8 @@ use dropshot::HttpResponseOk;
 use dropshot::RequestContext;
 use dropshot::Path;
 use dropshot::TypedBody;
+use dropshot::WebsocketUpgrade;
+use dropshot::WebsocketEndpointResult;
 use schemars::JsonSchema;
 use serde::{Serialize, Deserialize};
 
@@ -31,9 +33,21 @@ struct Target {
     pub name: String,
 }
 
+#[derive(Serialize, JsonSchema)]
+struct SerialPort {
+    pub id: String,
+    pub path: String,
+    pub name: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct SelectorPath {
     pub selector: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PortIdPath {
+    pub port_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -65,6 +79,14 @@ trait BootApi {
 
     #[endpoint {
         method = GET,
+        path = "/v1/serial-ports",
+    }]
+    async fn serial_ports(
+        rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseOk<Vec<SerialPort>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
         path = "/v1/probes/{selector}/target",
     }]
     async fn probes_target(
@@ -82,6 +104,16 @@ trait BootApi {
         path: Path<SelectorPath>,
         body: TypedBody<FlashRequest>,
     ) -> Result<HttpResponseOk<Empty>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/serial-ports/{port_id}/shell",
+    }]
+    async fn serial_shell(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<PortIdPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
 }
 
 
