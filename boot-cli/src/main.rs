@@ -39,6 +39,7 @@ enum Command {
     RemoveServer(RemoveServerArgs),
     Run(RunArgs),
     Shell(ShellArgs),
+    Attach(AttachArgs),
 }
 
 #[derive(Args)]
@@ -81,12 +82,24 @@ struct RunArgs {
     server_and_selector: String,
     /// Path to the ELF file
     elf_path: String,
+    /// Automatically attach and show defmt logs after flashing
+    #[arg(long)]
+    attach: bool,
 }
 
 #[derive(Args)]
 struct ShellArgs {
     /// Server name and serial port ID in format: {server-name}/{port-id}
     server_and_port: String,
+}
+
+#[derive(Args)]
+struct AttachArgs {
+    /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
+    server_and_selector: String,
+    /// Optional path to the ELF file for defmt decoding
+    #[arg(long)]
+    elf: Option<String>,
 }
 
 #[tokio::main]
@@ -104,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ListSerialPorts => list_serial_ports().await,
         Command::Run(args) => run(args).await,
         Command::Shell(args) => shell(args).await,
+        Command::Attach(args) => attach(args).await,
     }
 }
 
@@ -377,6 +391,150 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         })?;
     
     spinner.finish_with_message(format!("✓ Successfully flashed and started firmware on {}", selector));
+    
+    // If --attach flag is set, automatically attach with defmt decoding
+    if args.attach {
+        println!();
+        let attach_args = AttachArgs {
+            server_and_selector: args.server_and_selector.clone(),
+            elf: Some(args.elf_path),
+        };
+        attach(attach_args).await?;
+    }
+    
+    Ok(())
+}
+
+async fn attach(args: AttachArgs) -> anyhow::Result<()> {
+    use defmt_decoder::Table as DefmtTable;
+    
+    // Parse server name and selector
+    let parts: Vec<&str> = args.server_and_selector.split('/').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Invalid format. Expected {{server-name}}/{{debugprobeselector}}");
+    }
+    let server_name = parts[0];
+    let selector = parts[1];
+    
+    // Load server configuration
+    let config = server_config::ServerConfig::load()?;
+    let server = config.list_servers()
+        .iter()
+        .find(|s| s.name == server_name)
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+    
+    // If ELF file is provided, load it and create defmt decoder
+    let defmt_table = if let Some(elf_path) = &args.elf {
+        let elf_bytes = std::fs::read(elf_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read ELF file '{}': {}", elf_path, e))?;
+        
+        let table = DefmtTable::parse(&elf_bytes)?
+            .ok_or_else(|| anyhow::anyhow!("No defmt data found in ELF file"))?;
+        
+        Some((table, elf_bytes))
+    } else {
+        None
+    };
+    
+    let mut defmt_decoder = defmt_table.as_ref().map(|(table, _)| table.new_stream_decoder());
+    let defmt_locations = defmt_table.as_ref().and_then(|(table, elf_bytes)| {
+        table.get_locations(elf_bytes).ok()
+    });
+    
+    // Build WebSocket URL
+    let ws_url = server.url.replace("http://", "ws://").replace("https://", "wss://");
+    let ws_url = format!("{}/v1/probes/{}/attach", ws_url, selector);
+    
+    println!("Attaching to {} ({})", selector, server_name);
+    if args.elf.is_some() {
+        println!("Using defmt decoding");
+    } else {
+        println!("Using UTF-8 decoding (specify --elf for defmt support)");
+    }
+    println!("Press Ctrl+C to exit");
+    println!();
+    
+    // Connect to WebSocket
+    let (ws_stream, _) = connect_async(&ws_url).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to WebSocket: {}", e))?;
+    
+    let (_ws_tx, mut ws_rx) = ws_stream.split();
+    
+    // Read from WebSocket and write to stdout
+    use tokio::io::{AsyncWriteExt, stdout};
+    let mut stdout = stdout();
+    
+    while let Some(msg) = ws_rx.next().await {
+        match msg {
+            std::result::Result::Ok(Message::Binary(data)) => {
+                if let Some(stream_decoder) = &mut defmt_decoder {
+                    // Defmt decoding
+                    stream_decoder.received(&data);
+                    
+                    loop {
+                        match stream_decoder.decode() {
+                            Result::Ok(frame) => {
+                                // Format and print the decoded frame
+                                let (file, line, module) = defmt_locations.as_ref()
+                                    .and_then(|locs| locs.get(&frame.index()))
+                                    .map(|location| {
+                                        let file = location.file.display().to_string();
+                                        let line = location.line as u32;
+                                        let module = location.module.clone();
+                                        (file, line, module)
+                                    })
+                                    .unwrap_or_else(|| ("unknown".to_string(), 0, String::new()));
+                                
+                                let timestamp = if let Some(ts) = frame.display_timestamp() {
+                                    format!("{} ", ts)
+                                } else {
+                                    String::new()
+                                };
+                                
+                                use defmt_parser::Level;
+                                let level = match frame.level() {
+                                    Some(Level::Trace) => "TRACE",
+                                    Some(Level::Debug) => "DEBUG",
+                                    Some(Level::Info) => "INFO",
+                                    Some(Level::Warn) => "WARN",
+                                    Some(Level::Error) => "ERROR",
+                                    None => "",
+                                };
+                                
+                                let output = if !module.is_empty() {
+                                    format!("{}{} {}:{} > {}\n", timestamp, level, module, line, frame.display_message())
+                                } else {
+                                    format!("{}{} {}:{} > {}\n", timestamp, level, file, line, frame.display_message())
+                                };
+                                
+                                stdout.write_all(output.as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
+                            Result::Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
+                            Result::Err(defmt_decoder::DecodeError::Malformed) => {
+                                eprintln!("Warning: malformed defmt frame");
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // UTF-8 decoding fallback
+                    let text = String::from_utf8_lossy(&data);
+                    stdout.write_all(text.as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+            }
+            std::result::Result::Ok(Message::Text(text)) => {
+                stdout.write_all(text.as_bytes()).await?;
+                stdout.flush().await?;
+            }
+            std::result::Result::Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    
+    println!("\nConnection closed");
     
     Ok(())
 }

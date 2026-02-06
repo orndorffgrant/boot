@@ -114,6 +114,16 @@ trait BootApi {
         path: Path<PortIdPath>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/probes/{selector}/attach",
+    }]
+    async fn probe_attach(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
 }
 
 

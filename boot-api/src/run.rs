@@ -2,10 +2,12 @@ use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, ServerBuilder}
 use dropshot::{HttpError, HttpResponseOk, RequestContext, Path, TypedBody, WebsocketUpgrade, WebsocketEndpointResult};
 use probe_rs::probe;
 use probe_rs::flashing;
+use probe_rs::rtt::Rtt;
 use base64::prelude::*;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::{BootApi, Empty, Probe, Target, SerialPort, SelectorPath, PortIdPath, FlashRequest};
 
@@ -246,6 +248,108 @@ impl BootApi for ServerImpl {
             
             // Clean up the read task
             read_handle.abort();
+            
+            Ok(())
+        })
+    }
+
+    async fn probe_attach(
+        _rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult {
+        let selector_str = path.into_inner().selector;
+        
+        upgraded.handle(move |ws_stream| async move {
+            // Convert to WebSocket stream
+            let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                ws_stream.into_inner(),
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            ).await;
+            
+            let (mut ws_tx, mut ws_rx) = ws_stream.split();
+            
+            // Channel for RTT data from the blocking probe thread
+            let (rtt_tx, mut rtt_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            
+            // Move all probe-rs types into a blocking thread to avoid Send issues
+            let poll_handle = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let to_err = |msg: String| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+                };
+                
+                // Parse selector
+                let selector = selector_str.parse::<probe_rs::probe::DebugProbeSelector>()
+                    .map_err(|e| to_err(format!("Invalid selector: {}", e)))?;
+                
+                // Open probe
+                let lister = probe::list::Lister::new();
+                let probe = lister.open(selector)
+                    .map_err(|e| to_err(format!("Failed to open probe: {}", e)))?;
+                
+                // Attach to probe with auto-detect
+                let mut session = probe.attach(probe_rs::config::TargetSelector::Auto, probe_rs::Permissions::default())
+                    .map_err(|e| to_err(format!("Failed to attach to probe: {}", e)))?;
+                
+                // Get core
+                let mut core = session.core(0)
+                    .map_err(|e| to_err(format!("Failed to access core: {}", e)))?;
+                
+                // Attempt to attach to RTT
+                let mut rtt = Rtt::attach(&mut core)
+                    .map_err(|e| to_err(format!("Failed to attach to RTT: {}", e)))?;
+                
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let mut any_data = false;
+                    for channel in rtt.up_channels().iter_mut() {
+                        match channel.read(&mut core, &mut buffer) {
+                            Ok(count) if count > 0 => {
+                                any_data = true;
+                                // Send raw bytes - let the client decode (defmt or UTF-8)
+                                if rtt_tx.send(buffer[..count].to_vec()).is_err() {
+                                    return Ok(()); // WebSocket closed
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => return Err(to_err(format!("RTT read error: {}", e))),
+                        }
+                    }
+                    if !any_data {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            });
+            
+            // Handle bidirectional communication
+            loop {
+                tokio::select! {
+                    rtt_msg = rtt_rx.recv() => {
+                        match rtt_msg {
+                            Some(data) => {
+                                if ws_tx.send(Message::Binary(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    
+                    // Read from WebSocket (currently just monitoring for close)
+                    ws_msg = ws_rx.next() => {
+                        match ws_msg {
+                            Some(Ok(Message::Close(_))) | None => break,
+                            Some(Err(_)) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            
+            if let Ok(Err(e)) = poll_handle.await {
+                return Err(e);
+            }
             
             Ok(())
         })
