@@ -346,43 +346,6 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .find(|s| s.name == server_name)
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
     
-    // Create spinner for reading file
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap()
-    );
-    spinner.set_message(format!("Reading {}...", args.elf_path));
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-    
-    // Read ELF file
-    let elf_bytes = std::fs::read(&args.elf_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read ELF file '{}': {}", args.elf_path, e))?;
-    
-    spinner.finish_with_message(format!("Read {} ({} bytes)", args.elf_path, elf_bytes.len()));
-    
-    // Create spinner for encoding
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap()
-    );
-    spinner.set_message("Encoding to base64...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-    
-    // Encode to base64
-    let elf_data = base64::prelude::BASE64_STANDARD.encode(&elf_bytes);
-    
-    spinner.finish_and_clear();
-    
-    // Create client with longer timeout for large file transfers
-    let reqwest_client = reqwest::ClientBuilder::new()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
-    let client = boot_api_client::Client::new_with_client(&server.url, reqwest_client);
-    
     // Create spinner for flashing
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -390,8 +353,28 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .template("{spinner:.cyan} {msg}")
             .unwrap()
     );
-    spinner.set_message(format!("Flashing to {} via {}...", selector, server_name));
+    spinner.set_message(format!("Reading {}...", args.elf_path));
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    
+    // Read ELF file
+    let elf_bytes = std::fs::read(&args.elf_path)
+        .map_err(|e| {
+            spinner.finish_and_clear();
+            anyhow::anyhow!("Failed to read ELF file '{}': {}", args.elf_path, e)
+        })?;
+    
+    spinner.set_message("Encoding firmware...");
+    
+    // Encode to base64
+    let elf_data = base64::prelude::BASE64_STANDARD.encode(&elf_bytes);
+    
+    spinner.set_message(format!("Flashing to {}...", selector));
+    
+    // Create client with longer timeout for large file transfers
+    let reqwest_client = reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let client = boot_api_client::Client::new_with_client(&server.url, reqwest_client);
     
     client.flash_and_run(selector, &boot_api_client::types::FlashRequest { elf_data })
         .await
@@ -400,7 +383,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("Failed to flash firmware: {:#}", e)
         })?;
     
-    spinner.finish_with_message(format!("✓ Successfully flashed and started firmware on {}", selector));
+    spinner.finish_with_message(format!("✓ Flashed firmware ({} bytes)", elf_bytes.len()));
     
     // Attach by default unless --no-attach flag is set
     if !args.no_attach {
@@ -468,30 +451,45 @@ async fn attach(args: AttachArgs) -> anyhow::Result<()> {
         table.get_locations(elf_bytes).ok()
     });
     
+    // Create spinner for RTT attachment
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+    );
+    spinner.set_message("Loading ELF file...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    
     // Extract RTT address if we have the ELF file
     let rtt_addr = defmt_table.as_ref().and_then(|(_, elf_bytes)| extract_rtt_address(elf_bytes));
+    
+    if rtt_addr.is_some() {
+        spinner.set_message("Finding RTT control block...");
+    } else {
+        spinner.set_message("Scanning for RTT control block...");
+    }
     
     // Build WebSocket URL
     let ws_url = server.url.replace("http://", "ws://").replace("https://", "wss://");
     let ws_url = if let Some(addr) = rtt_addr {
-        println!("Found RTT control block at 0x{:x}", addr);
         format!("{}/v1/probes/{}/attach?rtt_addr=0x{:x}", ws_url, selector, addr)
     } else {
         format!("{}/v1/probes/{}/attach", ws_url, selector)
     };
     
-    println!("Attaching to {} ({})", selector, server_name);
-    if args.elf.is_some() {
-        println!("Using defmt decoding");
-    } else {
-        println!("Using UTF-8 decoding (specify --elf for defmt support)");
-    }
-    println!("Press Ctrl+C to exit");
-    println!();
+    spinner.set_message(format!("Attaching to {}...", selector));
     
     // Connect to WebSocket
     let (ws_stream, _) = connect_async(&ws_url).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to WebSocket: {}", e))?;
+        .map_err(|e| {
+            spinner.finish_and_clear();
+            anyhow::anyhow!("Failed to connect to WebSocket: {}", e)
+        })?;
+    
+    let encoding = if args.elf.is_some() { "defmt" } else { "UTF-8" };
+    spinner.finish_with_message(format!("✓ Attached to {}/{} RTT ({})", server_name, selector, encoding));
+    println!();
     
     let (_ws_tx, mut ws_rx) = ws_stream.split();
     
