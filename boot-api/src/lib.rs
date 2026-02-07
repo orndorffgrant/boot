@@ -2,6 +2,7 @@ use dropshot::HttpError;
 use dropshot::HttpResponseOk;
 use dropshot::RequestContext;
 use dropshot::Path;
+use dropshot::Query;
 use dropshot::TypedBody;
 use dropshot::WebsocketUpgrade;
 use dropshot::WebsocketEndpointResult;
@@ -53,6 +54,12 @@ struct PortIdPath {
 #[derive(Deserialize, JsonSchema)]
 struct FlashRequest {
     pub elf_data: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AttachQuery {
+    /// Optional RTT control block address (hex string, e.g., "0x20000000")
+    pub rtt_addr: Option<String>,
 }
 
 /// Defines the trait that captures all the methods.
@@ -122,6 +129,7 @@ trait BootApi {
     async fn probe_attach(
         rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
+        query: Query<AttachQuery>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 }

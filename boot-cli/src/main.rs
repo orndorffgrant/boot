@@ -84,9 +84,9 @@ struct RunArgs {
     server_and_selector: String,
     /// Path to the ELF file
     elf_path: String,
-    /// Automatically attach and show defmt logs after flashing
+    /// Don't attach and show defmt logs after flashing
     #[arg(long)]
-    attach: bool,
+    no_attach: bool,
 }
 
 #[derive(Args)]
@@ -402,8 +402,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     
     spinner.finish_with_message(format!("✓ Successfully flashed and started firmware on {}", selector));
     
-    // If --attach flag is set, automatically attach with defmt decoding
-    if args.attach {
+    // Attach by default unless --no-attach flag is set
+    if !args.no_attach {
         println!();
         let attach_args = AttachArgs {
             server_and_selector: args.server_and_selector.clone(),
@@ -413,6 +413,23 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
     
     Ok(())
+}
+
+fn extract_rtt_address(elf_bytes: &[u8]) -> Option<u64> {
+    use object::{Object, ObjectSymbol};
+    
+    let elf_file = object::File::parse(elf_bytes).ok()?;
+    
+    // Look for the RTT control block symbol (usually _SEGGER_RTT)
+    for symbol in elf_file.symbols() {
+        if let std::result::Result::Ok(name) = symbol.name() {
+            if name == "_SEGGER_RTT" {
+                return Some(symbol.address());
+            }
+        }
+    }
+    
+    None
 }
 
 async fn attach(args: AttachArgs) -> anyhow::Result<()> {
@@ -451,9 +468,17 @@ async fn attach(args: AttachArgs) -> anyhow::Result<()> {
         table.get_locations(elf_bytes).ok()
     });
     
+    // Extract RTT address if we have the ELF file
+    let rtt_addr = defmt_table.as_ref().and_then(|(_, elf_bytes)| extract_rtt_address(elf_bytes));
+    
     // Build WebSocket URL
     let ws_url = server.url.replace("http://", "ws://").replace("https://", "wss://");
-    let ws_url = format!("{}/v1/probes/{}/attach", ws_url, selector);
+    let ws_url = if let Some(addr) = rtt_addr {
+        println!("Found RTT control block at 0x{:x}", addr);
+        format!("{}/v1/probes/{}/attach?rtt_addr=0x{:x}", ws_url, selector, addr)
+    } else {
+        format!("{}/v1/probes/{}/attach", ws_url, selector)
+    };
     
     println!("Attaching to {} ({})", selector, server_name);
     if args.elf.is_some() {

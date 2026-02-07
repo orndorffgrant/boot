@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::{BootApi, Empty, Probe, Target, SerialPort, SelectorPath, PortIdPath, FlashRequest};
+use crate::{BootApi, Empty, Probe, Target, SerialPort, SelectorPath, PortIdPath, FlashRequest, AttachQuery};
 
 enum ServerImpl {}
 
@@ -256,9 +256,11 @@ impl BootApi for ServerImpl {
     async fn probe_attach(
         _rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
+        query: dropshot::Query<AttachQuery>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let selector_str = path.into_inner().selector;
+        let rtt_addr = query.into_inner().rtt_addr;
         
         upgraded.handle(move |ws_stream| async move {
             // Convert to WebSocket stream
@@ -297,12 +299,29 @@ impl BootApi for ServerImpl {
                     .map_err(|e| to_err(format!("Failed to access core: {}", e)))?;
                 
                 // Attempt to attach to RTT
-                // Note: This can be slow if the target has a lot of RAM to scan
-                eprintln!("Scanning for RTT control block...");
-                let scan_start = std::time::Instant::now();
-                let mut rtt = Rtt::attach(&mut core)
-                    .map_err(|e| to_err(format!("Failed to attach to RTT: {}", e)))?;
-                eprintln!("RTT attached in {:?}", scan_start.elapsed());
+                let mut rtt = if let Some(addr_str) = rtt_addr {
+                    // Parse the hex address
+                    let addr = if addr_str.starts_with("0x") || addr_str.starts_with("0X") {
+                        u64::from_str_radix(&addr_str[2..], 16)
+                    } else {
+                        u64::from_str_radix(&addr_str, 16)
+                    }.map_err(|e| to_err(format!("Invalid RTT address '{}': {}", addr_str, e)))?;
+                    
+                    eprintln!("Attaching to RTT at 0x{:x}...", addr);
+                    let scan_start = std::time::Instant::now();
+                    let rtt = Rtt::attach_at(&mut core, addr)
+                        .map_err(|e| to_err(format!("Failed to attach to RTT at 0x{:x}: {}", addr, e)))?;
+                    eprintln!("RTT attached in {:?}", scan_start.elapsed());
+                    rtt
+                } else {
+                    // Scan for RTT control block (slow for large RAM)
+                    eprintln!("Scanning for RTT control block...");
+                    let scan_start = std::time::Instant::now();
+                    let rtt = Rtt::attach(&mut core)
+                        .map_err(|e| to_err(format!("Failed to attach to RTT: {}", e)))?;
+                    eprintln!("RTT attached in {:?}", scan_start.elapsed());
+                    rtt
+                };
                 
                 let mut buffer = [0u8; 1024];
                 loop {

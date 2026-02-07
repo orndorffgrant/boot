@@ -284,6 +284,7 @@ dependencies = [
  "directories",
  "futures",
  "indicatif",
+ "object 0.37.3",
  "reqwest",
  "serde",
  "serde_json",
