@@ -59,6 +59,22 @@ pub fn stop_service() -> Result<()> {
     Ok(())
 }
 
+pub fn restart_service() -> Result<()> {
+    let service_name = "boot-api";
+    
+    let output = Command::new("systemctl")
+        .args(["restart", service_name])
+        .output()
+        .context("Failed to execute systemctl restart command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to restart systemd service: {}", stderr);
+    }
+    
+    Ok(())
+}
+
 pub fn start_service_if_needed() -> Result<()> {
     let service_name = "boot-api";
     

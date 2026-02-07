@@ -23,6 +23,8 @@ enum Command {
     StartServer(StartServerArgs),
     #[command(name = "stop-server")]
     StopServer,
+    #[command(name = "restart-server")]
+    RestartServer,
     #[command(name = "run-server")]
     RunServer(RunServerArgs),
     #[command(name = "api-desc")]
@@ -108,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::StartServer(args) => start_server(args).await,
         Command::StopServer => stop_server().await,
+        Command::RestartServer => restart_server().await,
         Command::RunServer(args) => run_server(args).await,
         Command::APIDesc => api_desc().await,
         Command::ListServers => list_servers().await,
@@ -196,6 +199,13 @@ async fn stop_server() -> anyhow::Result<()> {
     
     Ok(())
 }
+
+async fn restart_server() -> anyhow::Result<()> {
+    systemd_service::restart_service()?;
+    println!("Server restarted");
+    Ok(())
+}
+
 async fn run_server(args: RunServerArgs) -> anyhow::Result<()> {
     boot_api::run(args.host, args.port).await
 }

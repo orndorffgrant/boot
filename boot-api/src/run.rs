@@ -297,8 +297,12 @@ impl BootApi for ServerImpl {
                     .map_err(|e| to_err(format!("Failed to access core: {}", e)))?;
                 
                 // Attempt to attach to RTT
+                // Note: This can be slow if the target has a lot of RAM to scan
+                eprintln!("Scanning for RTT control block...");
+                let scan_start = std::time::Instant::now();
                 let mut rtt = Rtt::attach(&mut core)
                     .map_err(|e| to_err(format!("Failed to attach to RTT: {}", e)))?;
+                eprintln!("RTT attached in {:?}", scan_start.elapsed());
                 
                 let mut buffer = [0u8; 1024];
                 loop {
@@ -347,9 +351,17 @@ impl BootApi for ServerImpl {
                 }
             }
             
-            if let Ok(Err(e)) = poll_handle.await {
-                return Err(e);
-            }
+            // Clean up: drop the receiver to signal the blocking thread to stop
+            drop(rtt_rx);
+            
+            // Abort the blocking task to ensure it stops immediately
+            poll_handle.abort();
+            
+            // Give it a moment to clean up, but don't wait forever
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                poll_handle
+            ).await;
             
             Ok(())
         })
