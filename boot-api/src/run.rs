@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::{BootApi, Empty, Probe, Target, SerialPort, SelectorPath, PortIdPath, FlashRequest, AttachQuery};
+use crate::{BootApi, Empty, Probe, Target, SerialPort, SelectorPath, SelectorAndRttPath, PortIdPath, FlashRequest};
 
 enum ServerImpl {}
 
@@ -256,12 +256,28 @@ impl BootApi for ServerImpl {
     async fn probe_attach(
         _rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
-        query: dropshot::Query<AttachQuery>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let selector_str = path.into_inner().selector;
-        let rtt_addr = query.into_inner().rtt_addr;
-        
+        Self::probe_attach_impl(selector_str, None, upgraded)
+    }
+
+    async fn probe_attach_with_rtt(
+        _rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorAndRttPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult {
+        let path_params = path.into_inner();
+        Self::probe_attach_impl(path_params.selector, Some(path_params.rtt_addr), upgraded)
+    }
+}
+
+impl ServerImpl {
+    fn probe_attach_impl(
+        selector_str: String,
+        rtt_addr: Option<String>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult {
         upgraded.handle(move |ws_stream| async move {
             // Convert to WebSocket stream
             let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(

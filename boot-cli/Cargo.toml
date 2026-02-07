@@ -16,6 +16,7 @@ defmt-decoder.workspace = true
 defmt-parser.workspace = true
 directories.workspace = true
 futures.workspace = true
+hyper-util.workspace = true
 indicatif.workspace = true
 object.workspace = true
 boot-api = { workspace = true, features = ["run"] }

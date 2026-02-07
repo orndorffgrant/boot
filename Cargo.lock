@@ -283,6 +283,7 @@ dependencies = [
  "defmt-parser",
  "directories",
  "futures",
+ "hyper-util",
  "indicatif",
  "object 0.37.3",
  "reqwest",

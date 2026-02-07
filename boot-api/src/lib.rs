@@ -2,7 +2,6 @@ use dropshot::HttpError;
 use dropshot::HttpResponseOk;
 use dropshot::RequestContext;
 use dropshot::Path;
-use dropshot::Query;
 use dropshot::TypedBody;
 use dropshot::WebsocketUpgrade;
 use dropshot::WebsocketEndpointResult;
@@ -47,6 +46,12 @@ struct SelectorPath {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct SelectorAndRttPath {
+    pub selector: String,
+    pub rtt_addr: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct PortIdPath {
     pub port_id: String,
 }
@@ -54,12 +59,6 @@ struct PortIdPath {
 #[derive(Deserialize, JsonSchema)]
 struct FlashRequest {
     pub elf_data: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct AttachQuery {
-    /// Optional RTT control block address (hex string, e.g., "0x20000000")
-    pub rtt_addr: Option<String>,
 }
 
 /// Defines the trait that captures all the methods.
@@ -129,7 +128,16 @@ trait BootApi {
     async fn probe_attach(
         rqctx: RequestContext<Self::Context>,
         path: Path<SelectorPath>,
-        query: Query<AttachQuery>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/probes/{selector}/attach/{rtt_addr}",
+    }]
+    async fn probe_attach_with_rtt(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorAndRttPath>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 }

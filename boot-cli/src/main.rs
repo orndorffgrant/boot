@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use boot_api_client;
 
 mod server_config;
@@ -415,6 +415,21 @@ fn extract_rtt_address(elf_bytes: &[u8]) -> Option<u64> {
     None
 }
 
+async fn upgraded_to_websocket(
+    upgraded: reqwest::Upgraded,
+) -> tokio_tungstenite::WebSocketStream<reqwest::Upgraded> {
+    // reqwest::Upgraded implements AsyncRead + AsyncWrite, so we can use it directly
+    use tokio_tungstenite::WebSocketStream;
+    
+    // Convert the upgraded connection to a WebSocketStream
+    // Note: The WebSocket handshake was already done by reqwest, so we create the stream directly
+    WebSocketStream::from_raw_socket(
+        upgraded,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    ).await
+}
+
 async fn attach(args: AttachArgs) -> anyhow::Result<()> {
     use defmt_decoder::Table as DefmtTable;
     
@@ -470,22 +485,26 @@ async fn attach(args: AttachArgs) -> anyhow::Result<()> {
         spinner.set_message("Scanning for RTT control block...");
     }
     
-    // Build WebSocket URL
-    let ws_url = server.url.replace("http://", "ws://").replace("https://", "wss://");
-    let ws_url = if let Some(addr) = rtt_addr {
-        format!("{}/v1/probes/{}/attach?rtt_addr=0x{:x}", ws_url, selector, addr)
-    } else {
-        format!("{}/v1/probes/{}/attach", ws_url, selector)
-    };
-    
     spinner.set_message(format!("Attaching to {}...", selector));
     
-    // Connect to WebSocket
-    let (ws_stream, _) = connect_async(&ws_url).await
-        .map_err(|e| {
-            spinner.finish_and_clear();
-            anyhow::anyhow!("Failed to connect to WebSocket: {}", e)
-        })?;
+    // Use the generated client to connect
+    let client = boot_api_client::Client::new(&server.url);
+    
+    let upgraded = if let Some(addr) = rtt_addr {
+        // Use the endpoint with RTT address path parameter
+        client.probe_attach_with_rtt(selector, &format!("0x{:x}", addr)).await
+    } else {
+        // Use the endpoint without RTT address
+        client.probe_attach(selector).await
+    }
+    .map_err(|e| {
+        spinner.finish_and_clear();
+        anyhow::anyhow!("Failed to attach to probe: {:#}", e)
+    })?
+    .into_inner();
+    
+    // Convert the upgraded connection to a WebSocket
+    let ws_stream = upgraded_to_websocket(upgraded).await;
     
     let encoding = if args.elf.is_some() { "defmt" } else { "UTF-8" };
     spinner.finish_with_message(format!("✓ Attached to {}/{} RTT ({})", server_name, selector, encoding));
@@ -588,17 +607,18 @@ async fn shell(args: ShellArgs) -> anyhow::Result<()> {
         .find(|s| s.name == server_name)
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
     
-    // Build WebSocket URL
-    let ws_url = server.url.replace("http://", "ws://").replace("https://", "wss://");
-    let ws_url = format!("{}/v1/serial-ports/{}/shell", ws_url, port_id);
-    
     println!("Connecting to {} ({})", port_id, server_name);
     println!("Press Ctrl+C to exit");
     println!();
     
-    // Connect to WebSocket
-    let (ws_stream, _) = connect_async(&ws_url).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to WebSocket: {}", e))?;
+    // Use the generated client to connect
+    let client = boot_api_client::Client::new(&server.url);
+    let upgraded = client.serial_shell(port_id).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to serial port: {:#}", e))?
+        .into_inner();
+    
+    // Convert the upgraded connection to a WebSocket
+    let ws_stream = upgraded_to_websocket(upgraded).await;
     
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     

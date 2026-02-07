@@ -18,6 +18,7 @@ directories = "5.0"
 dropshot = "0.16"
 futures = "0.3"
 http = "1.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.17"
 object = "0.37"
 progenitor = "0.11"
