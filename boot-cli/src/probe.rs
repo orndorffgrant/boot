@@ -17,6 +17,9 @@ pub struct ProbeRunArgs {
     /// Don't attach and show defmt logs after flashing
     #[arg(long)]
     pub no_attach: bool,
+    /// Open serial shell instead of attaching (format: {server-name}/{port-id})
+    #[arg(short = 's', long = "serial-shell")]
+    pub serial_shell: Option<String>,
 }
 
 #[derive(Args)]
@@ -159,8 +162,16 @@ pub async fn probe_run(args: ProbeRunArgs) -> Result<()> {
     
     spinner.finish_with_message(format!("✓ Flashed firmware ({} bytes)", elf_bytes.len()));
     
-    // Attach by default unless --no-attach flag is set
-    if !args.no_attach {
+    // Handle post-flash action
+    if let Some(serial_shell) = args.serial_shell {
+        // Open serial shell instead of attaching
+        println!();
+        let serial_args = crate::serial_port::SerialShellArgs {
+            server_and_port: serial_shell,
+        };
+        crate::serial_port::serial_shell(serial_args).await?;
+    } else if !args.no_attach {
+        // Attach by default unless --no-attach flag is set
         println!();
         let attach_args = ProbeAttachArgs {
             server_and_selector: args.server_and_selector.clone(),

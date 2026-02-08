@@ -77,13 +77,8 @@ pub async fn start_server(args: StartServerArgs) -> Result<()> {
     // Remove existing "local" entry if it exists
     config.servers.retain(|s| s.name != "local");
     
-    // Determine the URL based on the host
-    let url = if host == "0.0.0.0".to_string() {
-        // If listening on all interfaces, use localhost for client connection
-        format!("http://localhost:{}", port)
-    } else {
-        format!("http://{}:{}", host, port)
-    };
+    // Store the actual URL (including 0.0.0.0 if that's what was specified)
+    let url = format!("http://{}:{}", host, port);
     
     // Add the local server
     config.add_server("local".to_string(), url)?;
