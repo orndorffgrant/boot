@@ -9,16 +9,20 @@ use schemars::JsonSchema;
 use serde::{Serialize, Deserialize};
 
 #[cfg(feature = "run")]
+mod probe;
+#[cfg(feature = "run")]
+mod serial_port;
+#[cfg(feature = "run")]
 mod run;
 #[cfg(feature = "run")]
 pub use run::run;
 
 #[derive(Serialize, JsonSchema)]
-struct Empty {
+pub struct Empty {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct Probe {
+pub struct Probe {
     pub id: String,
     pub name: String,
     pub vendor_id: u16,
@@ -29,35 +33,35 @@ struct Probe {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct Target {
+pub struct Target {
     pub name: String,
 }
 
 #[derive(Serialize, JsonSchema)]
-struct SerialPort {
+pub struct SerialPort {
     pub id: String,
     pub path: String,
     pub name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct SelectorPath {
+pub struct SelectorPath {
     pub selector: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct SelectorAndRttPath {
+pub struct SelectorAndRttPath {
     pub selector: String,
     pub rtt_addr: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct PortIdPath {
+pub struct PortIdPath {
     pub port_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct FlashRequest {
+pub struct FlashRequest {
     pub elf_data: String,
 }
 
@@ -141,8 +145,6 @@ trait BootApi {
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 }
-
-
 
 pub fn openapi() -> String {
     let description = boot_api_mod::stub_api_description().unwrap();
