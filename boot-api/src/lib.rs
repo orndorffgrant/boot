@@ -144,6 +144,16 @@ trait BootApi {
         path: Path<SelectorAndRttPath>,
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/probes/{selector}/dap",
+    }]
+    async fn probe_dap(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
 }
 
 pub fn openapi() -> String {

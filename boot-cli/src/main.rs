@@ -58,6 +58,10 @@ enum Command {
     #[command(name = "probe-attach")]
     ProbeAttach(probe::ProbeAttachArgs),
     
+    /// Start a DAP (Debug Adapter Protocol) server for a probe
+    #[command(name = "start-probe-dap")]
+    StartProbeDap(probe::StartProbeDapArgs),
+    
     // Serial Ports
     /// List available serial ports
     #[command(name = "list-serial-ports")]
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ListProbes => probe::list_probes().await,
         Command::ProbeRun(args) => probe::probe_run(args).await,
         Command::ProbeAttach(args) => probe::probe_attach(args).await,
+        Command::StartProbeDap(args) => probe::start_probe_dap(args).await,
         Command::ListSerialPorts => serial_port::list_serial_ports().await,
         Command::SerialShell(args) => serial_port::serial_shell(args).await,
         Command::APIDesc => api_desc().await,

@@ -6,18 +6,29 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 base64 = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+thiserror = { version = "2.0", optional = true }
 dropshot.workspace = true
 http.workspace = true
 probe-rs = { workspace = true, optional = true }
+probe-rs-debug = { workspace = true, optional = true }
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serialport = { workspace = true, optional = true }
+os_pipe = { workspace = true, optional = true }
+time = { version = "0.3", optional = true }
+tracing = { version = "0.1", optional = true }
 tokio.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 futures.workspace = true
+schemafy = { workspace = true, optional = true }
+addr2line = { workspace = true, optional = true }
+capstone = { workspace = true, optional = true }
+svd-parser = { workspace = true, optional = true }
 
 [features]
 default = ["run"]
-run = ["probe-rs", "base64", "serialport", "tokio-tungstenite"]
+run = ["probe-rs", "probe-rs-debug", "base64", "serialport", "tokio-tungstenite", "tokio-util", "schemafy", "addr2line", "capstone", "svd-parser", "os_pipe", "time", "tracing", "clap", "thiserror"]

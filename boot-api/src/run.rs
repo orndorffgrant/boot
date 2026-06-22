@@ -64,6 +64,14 @@ impl BootApi for ServerImpl {
     ) -> WebsocketEndpointResult {
         crate::probe::attach_with_rtt(rqctx, path, upgraded)
     }
+
+    async fn probe_dap(
+        rqctx: RequestContext<Self::Context>,
+        path: Path<SelectorPath>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult {
+        crate::probe::dap_server(rqctx, path, upgraded)
+    }
 }
 
 pub async fn run(host: Option<String>, port: Option<u16>) -> anyhow::Result<()> {

@@ -343,3 +343,125 @@ pub async fn probe_attach(args: ProbeAttachArgs) -> Result<()> {
     
     Ok(())
 }
+
+#[derive(Args)]
+pub struct StartProbeDapArgs {
+    /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
+    pub server_and_selector: String,
+    /// Port to listen on for DAP connections (default: 50000)
+    #[arg(short, long, default_value = "50000")]
+    pub port: u16,
+}
+
+pub async fn start_probe_dap(args: StartProbeDapArgs) -> Result<()> {
+    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    
+    // Parse server_name/selector format
+    let parts: Vec<&str> = args.server_and_selector.split('/').collect();
+    if parts.len() < 2 {
+        anyhow::bail!("Invalid format. Expected: {{server-name}}/{{selector}}");
+    }
+    
+    let server_name = parts[0];
+    let selector = parts[1..].join("/");
+    
+    // Get server URL from config
+    let config = server_config::ServerConfig::load()?;
+    let server = config.list_servers()
+        .find(|s| s.name == server_name)
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found in configuration", server_name))?;
+    
+    // Connect to backend WebSocket
+    let client = boot_api_client::Client::new(&server.url);
+    println!("Connecting to probe '{}' via server '{}'...", selector, server_name);
+    
+    let upgraded = client.probe_dap(&selector).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to probe: {}", e))?
+        .into_inner();
+    
+    // Convert to WebSocket
+    let ws_stream = upgraded_to_websocket(upgraded).await;
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    
+    // Start TCP server on localhost
+    let bind_addr = format!("127.0.0.1:{}", args.port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    println!("DAP server listening on {}", bind_addr);
+    println!("Connect your debugger to this address");
+    println!("Press Ctrl+C to stop\n");
+    
+    // Accept connections
+    loop {
+        tokio::select! {
+            // Accept new TCP connection
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((tcp_stream, addr)) => {
+                        println!("DAP client connected from {}", addr);
+                        
+                        let (mut tcp_rx, mut tcp_tx) = tcp_stream.into_split();
+                        
+                        // Spawn task to forward TCP -> WebSocket
+                        let mut ws_tx_clone = ws_tx.clone();
+                        let tcp_to_ws = tokio::spawn(async move {
+                            let mut buffer = vec![0u8; 4096];
+                            loop {
+                                match tcp_rx.read(&mut buffer).await {
+                                    Ok(0) => break, // EOF
+                                    Ok(n) => {
+                                        if ws_tx_clone.send(Message::Binary(buffer[..n].to_vec())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            println!("TCP->WS task ended");
+                        });
+                        
+                        // Spawn task to forward WebSocket -> TCP
+                        let ws_to_tcp = tokio::spawn(async move {
+                            while let Some(msg) = ws_rx.next().await {
+                                match msg {
+                                    Ok(Message::Binary(data)) => {
+                                        if tcp_tx.write_all(&data).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                            println!("WS->TCP task ended");
+                        });
+                        
+                        // Wait for either direction to close
+                        tokio::select! {
+                            _ = tcp_to_ws => {}
+                            _ = ws_to_tcp => {}
+                        }
+                        
+                        println!("DAP client disconnected from {}", addr);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to accept connection: {}", e);
+                    }
+                }
+            }
+            
+            // Handle Ctrl+C
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down DAP server...");
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+async fn upgraded_to_websocket(upgraded: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>) -> tokio_tungstenite::WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>> {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    tokio_tungstenite::WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await
+}

@@ -6,6 +6,7 @@ use base64::prelude::*;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use std::time::Duration;
+use std::io::{Read, Write};
 
 use crate::{Empty, Probe, Target, SelectorPath, SelectorAndRttPath, FlashRequest};
 
@@ -21,7 +22,7 @@ pub async fn list_probes(
             vendor_id: probe.vendor_id,
             product_id: probe.product_id,
             serial_number: probe.serial_number.clone(),
-            hid_interface: probe.hid_interface,
+            hid_interface: None,  // probe-rs 0.31 doesn't expose this field directly
             probe_type: probe.probe_type(),
         }
     }).collect();
@@ -246,6 +247,111 @@ fn attach_impl(
             Duration::from_secs(1),
             poll_handle
         ).await;
+        
+        Ok(())
+    })
+}
+
+pub fn dap_server(
+    _rqctx: RequestContext<()>,
+    path: Path<SelectorPath>,
+    upgraded: WebsocketUpgrade,
+) -> WebsocketEndpointResult {
+    let selector_str = path.into_inner().selector;
+    
+    upgraded.handle(move |ws_stream| async move {
+        // Convert to WebSocket stream
+        let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            ws_stream.into_inner(),
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        ).await;
+        
+        let (mut ws_tx, mut ws_rx) = ws_stream.split();
+        
+        // Create in-memory pipes for DAP communication
+        let (dap_reader, mut pipe_writer) = os_pipe::pipe()
+            .map_err(|e| anyhow::anyhow!("Failed to create pipe: {}", e))?;
+        let (mut pipe_reader, dap_writer) = os_pipe::pipe()
+            .map_err(|e| anyhow::anyhow!("Failed to create pipe: {}", e))?;
+        
+        // Channel for coordinating shutdown
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        
+        // Spawn DAP server in a blocking thread (probe-rs types are not Send)
+        let dap_handle = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let lister = probe::list::Lister::new();
+            
+            // Run the DAP session using probe-rs library
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(crate::probe_dap::run_dap_session(
+                dap_reader,
+                dap_writer,
+                &lister,
+                None,  // No log file
+            ))?;
+            
+            Ok(())
+        });
+        
+        // Spawn task to forward WebSocket -> DAP (pipe writer)
+        let ws_to_dap_handle = tokio::task::spawn(async move {
+            while let Some(msg) = ws_rx.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        // Forward binary WebSocket message to DAP pipe
+                        if pipe_writer.write_all(&data).is_err() {
+                            break;
+                        }
+                        if pipe_writer.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = shutdown_tx.send(());
+        });
+        
+        // Spawn task to forward DAP (pipe reader) -> WebSocket
+        let dap_to_ws_handle = tokio::task::spawn(async move {
+            let mut buffer = vec![0u8; 4096];
+            
+            loop {
+                tokio::select! {
+                    // Try to read from DAP pipe
+                    read_result = tokio::task::spawn_blocking({
+                        let mut pipe_reader = pipe_reader.try_clone().unwrap();
+                        move || {
+                            pipe_reader.read(&mut buffer)
+                        }
+                    }) => {
+                        match read_result {
+                            Ok(Ok(n)) if n > 0 => {
+                                // Forward to WebSocket
+                                if ws_tx.send(Message::Binary(buffer[..n].to_vec())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    
+                    // Check for shutdown signal
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                }
+            }
+        });
+        
+        // Wait for either the DAP server to exit or the WebSocket to close
+        tokio::select! {
+            _ = dap_handle => {}
+            _ = ws_to_dap_handle => {}
+            _ = dap_to_ws_handle => {}
+        }
         
         Ok(())
     })
