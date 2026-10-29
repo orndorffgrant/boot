@@ -9,39 +9,41 @@ members = [
 [workspace.dependencies]
 # Shared external dependencies
 anyhow = "1.0"
-base64 = "0.22"
-clap = { version = "4.5", features = ["derive"] }
-comfy-table = "7.1"
-defmt-decoder = { version = "0.3", features = ["unstable"] }
-defmt-parser = "0.3"
-directories = "5.0"
-dropshot = "0.16"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+comfy-table = "8.0"
+defmt-decoder = { version = "1.2", features = ["unstable"] }
+defmt-parser = "1.1"
+directories = "6.0"
+dropshot = "0.17"
 futures = "0.3"
-http = "1.4"
+http = "1.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-indicatif = "0.17"
-object = "0.37"
+indicatif = "0.18"
+object = "0.40"
 os_pipe = "1.2"
-progenitor = "0.11"
-progenitor-client = "0.11"
-prettyplease = "0.2"
-probe-rs = "0.31"
-probe-rs-debug = "0.31"
-rand = "0.8"
+progenitor = "0.15"
+progenitor-client = "0.15"
+prettyplease = "0.3"
+probe-rs = "0.32"
+probe-rs-debug = "0.32"
+rand = "0.10"
 tokio-util = { version = "0.7", features = ["codec"] }
 schemafy = "0.6"
-addr2line = "0.26"
+addr2line = "0.27"
 capstone = "0.14"
-svd-parser = "0.14.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+svd-parser = "0.14.10"
+# reqwest 0.13 renamed the "rustls-tls" feature to "rustls"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+# Pinned to 0.8 because dropshot and progenitor both generate schemas with schemars 0.8
 schemars = "0.8"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serialport = "4.5"
-syn = "2.0"
-tokio = { version = "1.48", features = ["full"] }
-tokio-tungstenite = "0.24"
+serialport = "4.10"
+syn = "3.0"
+tokio = { version = "1.54", features = ["full"] }
+tokio-tungstenite = "0.30"
 
 # Workspace crates
 boot-api = { path = "boot-api", default-features = false }

@@ -11,6 +11,8 @@ use serde::{Serialize, Deserialize};
 #[cfg(feature = "run")]
 mod probe;
 #[cfg(feature = "run")]
+mod probe_dap;
+#[cfg(feature = "run")]
 mod serial_port;
 #[cfg(feature = "run")]
 mod run;

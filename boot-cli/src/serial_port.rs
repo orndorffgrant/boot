@@ -22,7 +22,7 @@ pub async fn list_serial_ports() -> Result<()> {
     }
     
     let mut table = Table::new();
-    table.load_preset(NOTHING);
+    table.load_style(NOTHING);
     
     for server in servers {
         let client = boot_api_client::Client::new(&server.url);
@@ -104,7 +104,7 @@ pub async fn serial_shell(args: SerialShellArgs) -> Result<()> {
             match stdin.read(&mut buffer).await {
                 std::result::Result::Ok(0) => break,
                 std::result::Result::Ok(n) => {
-                    if ws_tx.send(Message::Binary(buffer[..n].to_vec())).await.is_err() {
+                    if ws_tx.send(Message::Binary(buffer[..n].to_vec().into())).await.is_err() {
                         break;
                     }
                 }

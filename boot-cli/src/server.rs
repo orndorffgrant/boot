@@ -46,7 +46,7 @@ fn print_servers_table(servers: &[server_config::Server], highlight_name: Option
     }
     
     let mut table = Table::new();
-    table.load_preset(NOTHING);
+    table.load_style(NOTHING);
     
     for server in servers {
         if let Some(name) = highlight_name {

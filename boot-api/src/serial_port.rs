@@ -108,7 +108,7 @@ pub fn serial_shell(
             tokio::select! {
                 // Read from serial port channel
                 Some(data) = serial_rx.recv() => {
-                    if ws_tx.send(Message::Binary(data)).await.is_err() {
+                    if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                         break;
                     }
                 }

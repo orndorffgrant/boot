@@ -87,7 +87,7 @@ pub async fn flash_and_run(
     let result = flashing::download_file(
         &mut session, 
         &temp_elf_path, 
-        flashing::Format::Elf(Default::default())
+        flashing::ElfLoader(flashing::ElfOptions::default())
     );
     
     // Clean up temporary file
@@ -217,7 +217,7 @@ fn attach_impl(
                 rtt_msg = rtt_rx.recv() => {
                     match rtt_msg {
                         Some(data) => {
-                            if ws_tx.send(Message::Binary(data)).await.is_err() {
+                            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -257,8 +257,14 @@ pub fn dap_server(
     path: Path<SelectorPath>,
     upgraded: WebsocketUpgrade,
 ) -> WebsocketEndpointResult {
-    let selector_str = path.into_inner().selector;
-    
+    let _selector_str = path.into_inner().selector;
+
+    if !crate::probe_dap::DAP_SUPPORTED {
+        return Err(HttpError::for_internal_error(
+            "DAP support is not implemented yet".to_string(),
+        ));
+    }
+
     upgraded.handle(move |ws_stream| async move {
         // Convert to WebSocket stream
         let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -316,21 +322,21 @@ pub fn dap_server(
         
         // Spawn task to forward DAP (pipe reader) -> WebSocket
         let dap_to_ws_handle = tokio::task::spawn(async move {
-            let mut buffer = vec![0u8; 4096];
-            
             loop {
                 tokio::select! {
                     // Try to read from DAP pipe
                     read_result = tokio::task::spawn_blocking({
                         let mut pipe_reader = pipe_reader.try_clone().unwrap();
                         move || {
-                            pipe_reader.read(&mut buffer)
+                            let mut buffer = vec![0u8; 4096];
+                            let n = pipe_reader.read(&mut buffer)?;
+                            std::io::Result::Ok((buffer, n))
                         }
                     }) => {
                         match read_result {
-                            Ok(Ok(n)) if n > 0 => {
+                            Ok(Ok((buffer, n))) if n > 0 => {
                                 // Forward to WebSocket
-                                if ws_tx.send(Message::Binary(buffer[..n].to_vec())).await.is_err() {
+                                if ws_tx.send(Message::Binary(buffer[..n].to_vec().into())).await.is_err() {
                                     break;
                                 }
                             }
