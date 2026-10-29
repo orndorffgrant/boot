@@ -22,7 +22,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.18"
 object = "0.40"
 os_pipe = "1.2"
-progenitor = "0.15"
+# The "macro" feature is unused (build.rs calls Generator directly) and pulls
+# deprecated serde_yaml/unsafe-libyaml.
+progenitor = { version = "0.15", default-features = false }
 progenitor-client = "0.15"
 prettyplease = "0.3"
 probe-rs = "0.32"
