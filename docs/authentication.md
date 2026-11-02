@@ -2,7 +2,7 @@
 
 **Status:** Proposed  
 **Date:** 2026-10-28  
-**Revision:** 8 — API DB is always read-write; remove read-only mode assumptions  
+**Revision:** 10 — Per-request token lookup; credentials merged into servers
 **Scope:** `boot-api`, `boot-api-client`, `boot-cli`
 
 ## Summary
@@ -32,16 +32,16 @@ This design adds **opaque bearer tokens**:
 - Non-loopback binds require TLS or an explicit `--allow-insecure-http`
   acknowledgement. SSH port-forwarding and WireGuard/Tailscale remain the
   recommended remote patterns.
-- The design targets Dropshot `0.17.1` (current latest), which requires Rust 1.85
-  and edition 2024.
+- The design targets Dropshot `0.17.1` and SQLx `0.9` with edition 2024. SQLx 0.9
+  requires Rust 1.94.
 
 ## Current state
 
 - `boot-api/src/lib.rs` defines the API trait; every endpoint is open.
 - `boot-api/src/run.rs` uses `type Context = ()` and binds `--host`/`--port`
   (default `127.0.0.1:46673`).
-- `boot-cli/src/server_config.rs` stores only `{ name, url }` in
-  `$XDG_DATA_HOME/boot/servers.json`.
+- `boot-cli/src/cli_db.rs` stores server entries and credentials in
+  `$XDG_DATA_HOME/boot/boot-cli.sqlite3`.
 - `boot-cli/src/probe.rs` and `serial_port.rs` use
   `boot_api_client::Client::new(&server.url)`.
 - `boot-cli/src/systemd_service.rs` starts `boot run-server` as a transient unit.
@@ -111,6 +111,7 @@ existing deployments.
 | Credential | Opaque 256-bit bearer token, `boot_v1_...` |
 | Transport | Loopback default; TLS or encrypted overlay for remote |
 | API DB storage | SHA-256 hashes in `boot.sqlite3`, mode `0600` |
+| Query layer | SQLx 0.9 async SQLite pools, `query!`/`query_as!`, committed `.sqlx` offline cache |
 | CLI DB storage | `boot-cli.sqlite3` for servers and plaintext client tokens, mode `0600` |
 | Enforcement | Dropshot 0.17.1 `SharedExtractor` (`Auth<Read>`, `Auth<Control>`, `Auth<Admin>`) |
 | Scopes | `read`, `control`, `admin`; `admin` implies both others |
@@ -118,7 +119,7 @@ existing deployments.
 | CLI naming | `boot admin create-token`, `boot admin list-tokens`, `boot admin revoke-token`; verb-noun leaves |
 | Provisioning | First run auto-creates an admin `local` token; `--no-provision` skips only local auto-provisioning |
 | API DB access | Read-write for both the server and CLI; migrations always run |
-| Revocation | SQLite delete + immediate snapshot update + hot reload; WebSockets revalidate |
+| Revocation | SQLite delete + per-request token lookup; WebSockets revalidate with a DB read |
 | Server DB writes | Writer connection for `/v1/tokens`; no per-request API DB writes |
 | OpenAPI | HTTP bearer scheme, 401/403 responses, admin endpoints included |
 
@@ -182,7 +183,7 @@ Why SQLite rather than JSON:
   leave a half-written file.
 - The server can detect committed changes without re-parsing a whole document.
 - Unique names and token hashes are enforced by the schema.
-- `servers` and `credentials` can be updated atomically in one transaction.
+- `servers` rows, including their optional token, can be updated atomically in one transaction.
 - The database is a standard format with backup and inspection tools.
 
 Why two databases:
@@ -197,19 +198,17 @@ Why two databases:
 The API DB is written by both the CLI and the server. The CLI writes it directly
 when `boot admin` targets the local database (the default); the server writes it
 through the `/v1/tokens` admin endpoints. Keep both paths in the same module:
-writers serialize with `BEGIN IMMEDIATE`, and the server updates its in-memory
-snapshot on the commit path. `--no-provision` only skips creating the local
-token/server entry/credential; migrations and the admin endpoints are unaffected.
+writers serialize with `BEGIN IMMEDIATE`. `--no-provision` only skips creating the
+local token/server entry/credential; migrations and the admin endpoints are
+unaffected.
 
 ### API database schema
 
 ```sql
 PRAGMA application_id = 0x424F4F54;  -- "BOOT"
 
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL
-);
+-- Schema migrations are managed by sqlx::migrate! and tracked in
+-- _sqlx_migrations.
 
 CREATE TABLE IF NOT EXISTS tokens (
     id         TEXT    PRIMARY KEY,   -- 16 lowercase hex characters
@@ -243,9 +242,13 @@ Schema notes:
 
 - `PRAGMA application_id = 0x424F4F54` (`BOOT`) distinguishes this file from the
   CLI DB (`0x42434C49`, `BCLI`) and from unrelated SQLite files.
-- `schema_migrations` is the source of truth for applied migrations. A database
-  with a version newer than the binary supports is a startup error; do not run an
-  older server against a newer schema.
+- `_sqlx_migrations` is the source of truth for applied migrations. A database
+  with a migration that the binary does not know about is a startup error; do not
+  run an older server against a newer schema.
+- Queries that access tokens are written with `sqlx::query!`/`sqlx::query_as!` and
+  checked against a development schema at build time. The generated query metadata
+  lives in the committed `.sqlx/` directory, so normal builds do not need a live
+  database.
 - All statements use bound parameters. Token names are never interpolated into SQL.
 - `token_hash` is unique, which also creates the lookup index.
 
@@ -254,32 +257,23 @@ Schema notes:
 ```sql
 PRAGMA application_id = 0x42434C49;  -- "BCLI"
 
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL
-);
+-- Schema migrations are managed by sqlx::migrate! and tracked in
+-- _sqlx_migrations.
 
 CREATE TABLE IF NOT EXISTS servers (
     name       TEXT PRIMARY KEY,
     url        TEXT NOT NULL,
     ca_cert    TEXT,
+    token      TEXT,                -- NULL = no credential stored
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK (name <> ''),
     CHECK (url LIKE 'http://%' OR url LIKE 'https://%')
 );
-
-CREATE TABLE IF NOT EXISTS credentials (
-    server_name TEXT PRIMARY KEY
-        REFERENCES servers(name) ON DELETE CASCADE,
-    token       TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
-);
 ```
 
-- A server and its credential are separate rows but the same database, so `add-server`
-  can insert both in one transaction and `remove-server` can rely on
-  `ON DELETE CASCADE`.
+- The server and its optional credential live on the same row, so `add-server`,
+  `set-token`, and `remove-server` are single-row operations.
 - `url` is stored once. There is no separate URL/token file that can disagree.
 - `ca_cert` is an optional PEM root for self-signed servers. It is a path, not a
   secret.
@@ -322,8 +316,11 @@ File and directory permissions:
 
 - Create the parent directory with mode `0700` and the database file with explicit
   mode `0600` (for example, pre-create with
-  `OpenOptionsExt::mode(0o600)` before opening it with `rusqlite`). Do not rely on
-  the process umask.
+  `OpenOptionsExt::mode(0o600)` before opening it with SQLx). Do not rely on the
+  process umask.
+- Apply these settings through `SqliteConnectOptions` (`journal_mode`,
+  `synchronous`, `foreign_keys`, `busy_timeout`, `secure_delete`) so every pooled
+  connection gets the same configuration.
 - On open, verify the main database file is not group- or world-readable. If it is,
   refuse to use it and print the exact `chmod` command. The parent directory being
   `0700` protects transient journals.
@@ -335,9 +332,9 @@ File and directory permissions:
 
 The workspace currently pins `dropshot = "0.16"`. Update it to `0.17` (resolving to
 `0.17.1` at the time of writing) and update the lockfile; if the lockfile is
-already pinned, use `cargo update -p dropshot --precise 0.17.1`. Dropshot 0.17
-requires Rust 1.85 and edition 2024; the workspace already uses edition 2024, so
-also record `rust-version = "1.85"` in the workspace package metadata.
+already pinned, use `cargo update -p dropshot --precise 0.17.1`. Dropshot 0.17 and SQLx 0.9
+with edition 2024 require a current toolchain; the workspace records
+`rust-version = "1.94"` in its package metadata.
 
 Relevant Dropshot 0.17.1 facts, verified against the current API docs:
 
@@ -670,8 +667,8 @@ $ boot admin --server pi revoke-token ci
   the token or hash; in remote mode it marks the requesting token with `current`.
 - `create-token` writes in one `BEGIN IMMEDIATE` transaction and prints the secret
   only to stdout; stderr warns that it will not be shown again.
-- Local writes are picked up by the reloader. HTTP admin writes update the
-  in-memory snapshot on the commit path, so a new token is usable immediately.
+- Token creation and revocation are visible to the next request immediately,
+  whether the write came from the CLI or the HTTP admin API.
 - If the API DB is locked or unwritable, the command fails with a clear error.
 - `--server` uses the stored token for that entry and requires the `admin` scope.
   A `403` means the stored credential is not an admin token; store one with
@@ -681,39 +678,21 @@ There is still no unauthenticated bootstrap endpoint. The first admin token come
 from filesystem provisioning (`boot start-server` or `boot admin` with direct
 `--api-db` access), which is the same trust boundary as the `0600` database file.
 
-#### Revocation and hot reload
+#### Revocation
 
-- The server keeps an in-memory snapshot of the token table:
-  `HashMap<[u8; 32], TokenRecord>` by hash and `HashMap<String, TokenRecord>` by id.
-- A dedicated blocking thread opens its own SQLite connection to the API DB and
-  polls `PRAGMA data_version`, `PRAGMA schema_version`, and the file metadata every
-  1–2 seconds. When any changes (or the file is replaced), it reopens if needed, runs
-  one `SELECT` over `tokens`, and swaps in a new snapshot. There is no per-request
-  database I/O.
-- `data_version` changes when another connection commits, which covers CLI writes
-  and the server's admin writer connection. When `boot-api` writes through
-  `/v1/tokens`, it updates the in-memory snapshot on the same commit path (or bumps
-  a generation counter) instead of waiting for the poller, so a just-created token
-  is accepted immediately and a revoked one stops working at once.
-- It works with the rollback journal. The reloader uses its own connection; the
-  admin endpoints use a separate writer connection. `--no-provision` leaves both
-  connections in place.
-- An admin write commits and then swaps the shared snapshot before returning `201`
-  or `200`. The request path never holds the write lock: `BEGIN IMMEDIATE` covers
-  only the `DELETE`/`INSERT` statements, and the in-memory swap happens after
-  `COMMIT`. A failed commit leaves the snapshot untouched.
-- At startup, a missing, unreadable, or wrong-application-id API DB is fatal: fail
-  closed. A schema version newer than the binary supports is also fatal.
-- If a reload fails transiently (`SQLITE_BUSY`, an interrupted read), keep the last
-  known-good snapshot and retry. If the database is deleted, replaced with a
-  different application id or schema, or remains unreadable for 30 seconds, swap in
-  an empty snapshot and log an error. Protected requests then fail with `401`.
-- SQLite transactions eliminate the old "half-written JSON parse error" class: a
-  reader sees either the old or the new committed token set.
-- Revocations from the CLI apply within the reload interval; revocations through
-  `/v1/tokens` apply immediately.
-- Active WebSockets store the token id and revalidate periodically; revoked or
-  expired tokens close the connection.
+- Authentication performs one indexed `SELECT` against `tokens` on each request.
+  There is no in-memory snapshot and no background reloader.
+- `token_hash` is unique, so lookup by hash uses the existing SQLite index. The
+  table is small and the query is a single read on a pooled connection.
+- Creating or revoking a token deletes/inserts the row; the next request sees the
+  committed state. This applies equally to CLI writes and `/v1/tokens` writes.
+- If the database read fails, the request fails closed rather than accepting a
+  potentially revoked token.
+- Active WebSockets store the token id and revalidate periodically by querying the
+  token row. Revoked or expired tokens close the connection. A few seconds of
+  revalidation delay is acceptable for this tool.
+- Snapshotting can be added behind the `TokenStore` interface later if profiling
+  shows a need. It is intentionally not part of the initial implementation.
 
 ### WebSockets
 
@@ -724,8 +703,8 @@ an upgrade.
 After upgrade:
 
 - Pass the `Principal` (token id/name) into the handler.
-- On a periodic tick (for example every 5 seconds), check that the token id is
-  still present, unexpired, and has `control` in the in-memory snapshot.
+- On a periodic tick (for example every 5 seconds), re-read the token row and
+  check that it is still present, unexpired, and has `control`.
 - If not, send a WebSocket `Close` with policy-violation status and stop the
   probe/serial/DAP loop.
 - Enforce an idle timeout and a global/per-token session limit to avoid leaving
@@ -963,8 +942,7 @@ Behavior:
   non-interactive use; it does not skip the warning text.
 - Listing marks the requesting token with `current` in remote mode. Direct mode has
   no request identity, so it shows no marker.
-- Direct writes are soon picked up by the reloader; HTTP admin writes update the
-  snapshot immediately.
+- Direct and HTTP admin writes are visible to the next request.
 - If the API DB is locked or unwritable, the command fails with a clear error.
 
 ### Client-side credentials
@@ -1032,20 +1010,24 @@ the same databases even if its working directory or `HOME` differs.
 
 | File | Change |
 | --- | --- |
-| `Cargo.toml` | `dropshot = "0.17"`; add `rusqlite = { version = "0.41", features = ["bundled"] }` and `sha2 = "0.11"`. Record `rust-version = "1.85"`. |
-| `boot-api/Cargo.toml` | Add `sha2` and `directories`; make `base64` non-optional and remove it from the `run` feature list; add optional `rand`, `rusqlite`; include the DB module in the `run` feature. |
-| `boot-api/src/auth.rs` (new) | Token format, hashing, scopes, `AuthState` snapshot, `Auth` extractor. |
-| `boot-api/src/api_db.rs` (new, `#[cfg(feature = "run")]`) | API DB open/schema setup, read and write connection helpers, token create/list/revoke/load, reloader, `data_version` support. |
+| `Cargo.toml` | `dropshot = "0.17"`; add `sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }`, `async-trait`, and `sha2 = "0.11"`. Record `rust-version = "1.94"`. |
+| `boot-api/Cargo.toml` | Add `sha2`, `directories`, and `async-trait`; make `base64` non-optional and remove it from the `run` feature list; add optional `rand` and `sqlx`; include the DB module in the `run` feature. |
+| `.cargo/config.toml` | Set `SQLX_OFFLINE=true` so builds use the committed `.sqlx/` query cache. |
+| `.sqlx/` (new) | Compile-time query metadata generated by `cargo sqlx prepare --workspace`. |
+| `boot-api/src/auth.rs` (new) | Token format, hashing, scopes, per-request lookup, `Auth` extractor. |
+| `boot-api/src/api_db.rs` (new, `#[cfg(feature = "run")]`) | SQLx API DB pool, migrations, token lookup/create/list/revoke. |
+| `boot-api/migrations/0001_auth.sql` (new) | API DB token table migration. |
 | `boot-api/src/lib.rs` | `pub mod auth`; add `Auth<Read>`/`Auth<Control>`/`Auth<Admin>` args; add `/v1/tokens` endpoint types and methods; post-process OpenAPI security. |
-| `boot-api/src/run.rs` | `type Context = AuthState`; open/setup/provision API DB; open the admin writer; implement token handlers; spawn reloader; TLS/exposure checks; `--api-db`, `--cli-db`, `--no-provision`, `--advertise-url`. |
+| `boot-api/src/run.rs` | `type Context = AuthState`; open/setup/provision API DB; implement token handlers; TLS/exposure checks; `--api-db`, `--cli-db`, `--no-provision`, `--advertise-url`. |
 | `boot-api/src/probe.rs`, `serial_port.rs` | Change `RequestContext<()>` to `RequestContext<AuthState>`; pass `Principal` into WebSocket handlers for revalidation. |
-| `boot-cli/Cargo.toml` | Add `rusqlite` (bundled) for the CLI DB. |
-| `boot-cli/src/cli_db.rs` (new) | CLI DB open/schema setup, server/credential CRUD. |
+| `boot-cli/Cargo.toml` | Add `sqlx` for the CLI DB. |
+| `boot-cli/migrations/0001_cli.sql` (new) | CLI DB server/credential migration; the optional token lives on the server row. |
+| `boot-cli/src/cli_db.rs` (new) | SQLx CLI DB pool, migrations, server/credential CRUD. |
 | `boot-cli/src/admin.rs` (new) | `boot admin` subcommand tree; direct API DB and `--server` HTTP modes; create/list/revoke; confirmation and `current` warnings. |
-| `boot-cli/src/auth.rs` (new) | Client credential lookup, `set-token`, `check-auth` (including admin-scope probe). |
-| `boot-cli/src/server_config.rs` | Replace JSON load/save with DB-backed `ServerEntry`/`ServerConfig`. |
+| `boot-cli/src/auth.rs` (new) | Client credential lookup and `set-token`. |
+| `boot-cli/src/server_config.rs` | Removed; server/credential state is used directly through `cli_db.rs`. |
 | `boot-cli/src/main.rs` | Add the `Admin` subcommand and global `--cli-db`/`--api-db` handling; remove top-level token commands. |
-| `boot-cli/src/server.rs` | Prepare both DBs before starting the unit; auto-provision an admin `local` token; upsert `local`; token/TLS flags; non-loopback guard; pass `--api-db`/`--cli-db` to systemd; stop deleting local config in `stop-server`. |
+| `boot-cli/src/server.rs` | `add-server`, `check-auth`, server listing/removal; prepare both DBs before starting the unit; auto-provision an admin `local` token; upsert `local`; token/TLS flags; non-loopback guard; pass `--api-db`/`--cli-db` to systemd; stop deleting local config in `stop-server`. |
 | `boot-cli/src/systemd_service.rs` | Forward `--api-db`, `--cli-db`, TLS, and advertise flags; never print secrets. |
 | `boot-cli/src/probe.rs`, `serial_port.rs` | Replace `Client::new` with `api_client()`; map 401/403; use the same client for upgrades. |
 | `boot-api-client/build.rs` | No code change; regenerate from the updated spec (including `/v1/tokens`) and validate against Dropshot 0.17.1. |
@@ -1079,10 +1061,8 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
 - The stored value is a 32-byte SHA-256 hash, not the plaintext token.
 - Token names containing SQL metacharacters are handled as bound parameters.
 - A hand-edited weak token is rejected by format validation.
-- Reload on `data_version` change revokes a removed token; a deleted DB fails
-  closed; a transient read error keeps the last good snapshot.
-- A token inserted through the API DB write path is accepted immediately, and a
-  later poller pass does not drop or duplicate it.
+- A token inserted through the API DB write path is accepted immediately.
+- A token revoked through the CLI or admin API is rejected on the next request.
 - The API DB rejects group/world-readable permissions.
 
 ### Integration tests
@@ -1097,10 +1077,9 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
   accepted and then fails at probe lookup if no hardware is present.
 - Revoke a token while a WebSocket is open; the connection closes within the
   revalidation interval.
-- Create a token through `POST /v1/tokens` and immediately use it on `GET /v1/probes`:
-  it must work without waiting for the reloader.
+- Create a token through `POST /v1/tokens` and immediately use it on `GET /v1/probes`.
 - Revoke through `DELETE /v1/tokens/{name}` and immediately reuse it: it must be
-  rejected without waiting for the reloader.
+  rejected.
 - The auto-provisioned `local` token has `read,control,admin` and can call
   `/v1/tokens`.
 - The server applies migrations on startup even with `--no-provision`, and
@@ -1116,7 +1095,7 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
   its plaintext in the CLI DB only.
 - `boot admin create-token` writes `0600`, prints one secret, and
   `boot admin list-tokens` does not.
-- `boot admin revoke-token` removes the row and hot reload takes effect.
+- `boot admin revoke-token` removes the row and the next request rejects it.
 - `boot admin --server pi ...` calls `/v1/tokens`, uses the stored credential, and
   fails with the admin-scope message for a non-admin token.
 - `boot admin --server pi` with `--api-db` is rejected as conflicting.
@@ -1202,8 +1181,7 @@ $ boot add-server pi http://127.0.0.1:46673 --token-stdin
    `boot admin --server pi revoke-token laptop`).
 
 Existing WebSockets on the old token close within the revalidation interval.
-Because admin writes update the snapshot immediately, the new token works on the
-first request.
+The new token works on the next request.
 
 ### Lost or stolen token
 

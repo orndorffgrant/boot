@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO servers (name, url, ca_cert, token, created_at, updated_at)\n             VALUES (?, ?, ?, ?, ?, ?)\n             ON CONFLICT(name) DO UPDATE SET\n                 url = excluded.url,\n                 ca_cert = COALESCE(excluded.ca_cert, servers.ca_cert),\n                 token = COALESCE(excluded.token, servers.token),\n                 updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "94f2d617288b3531cab31897fee68014e080f870c3caac35e7f585bc84383a53"
+}

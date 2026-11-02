@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT name AS \"name!\", url AS \"url!\", ca_cert, token\n             FROM servers\n             ORDER BY name",
+  "describe": {
+    "columns": [
+      {
+        "name": "name!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "servers",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "url!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "servers",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "name": "ca_cert",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "servers",
+            "name": "ca_cert"
+          }
+        }
+      },
+      {
+        "name": "token",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "servers",
+            "name": "token"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "ff25a7dcdfda3fa15ef3fb512f0f3bfbdd9244852ef887ff2b22643426564106"
+}

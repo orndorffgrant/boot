@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT scopes, expires_at FROM tokens",
+  "describe": {
+    "columns": [
+      {
+        "name": "scopes",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "scopes"
+          }
+        }
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "21f86cddd5c80266ed9dda464b21acc8b24a2bd71d360bcc0fb7b1b8b291736c"
+}

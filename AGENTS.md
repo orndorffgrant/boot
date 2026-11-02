@@ -26,7 +26,7 @@ Rust cargo monorepo for embedded device flashing/debugging via HTTP API + CLI.
 - **Functions**:
   - Server mgmt: start-server (systemd), stop-server, run-server
   - Remote ops: list-probes, list-serial-ports, run (flash), shell (serial WebSocket)
-  - Config: add/remove servers via server_config.rs
+  - Config: add/remove servers via cli_db.rs
 
 ## Dependency Graph
 ```

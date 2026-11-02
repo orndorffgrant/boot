@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM servers WHERE name = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f8d5207b681785ecd14cd0bda45f6d1696af6ce142bc600f680fdd151530ab96"
+}

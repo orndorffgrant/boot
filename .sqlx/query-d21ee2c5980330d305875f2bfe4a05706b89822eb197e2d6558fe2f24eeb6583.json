@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM tokens WHERE name = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d21ee2c5980330d305875f2bfe4a05706b89822eb197e2d6558fe2f24eeb6583"
+}

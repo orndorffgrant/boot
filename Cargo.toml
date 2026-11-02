@@ -6,9 +6,13 @@ members = [
     "boot-cli",
 ]
 
+[workspace.package]
+rust-version = "1.94"
+
 [workspace.dependencies]
 # Shared external dependencies
 anyhow = "1.0"
+async-trait = "0.1"
 base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 comfy-table = "8.0"
@@ -43,7 +47,11 @@ semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serialport = "4.10"
+sha2 = "0.11"
+slog = "2.8"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 syn = "3.0"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1.54", features = ["full"] }
 tokio-tungstenite = "0.30"
 

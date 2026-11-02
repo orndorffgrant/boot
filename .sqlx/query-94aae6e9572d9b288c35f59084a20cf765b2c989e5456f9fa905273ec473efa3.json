@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO servers (name, url, ca_cert, token, created_at, updated_at)\n             VALUES (?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "94aae6e9572d9b288c35f59084a20cf765b2c989e5456f9fa905273ec473efa3"
+}

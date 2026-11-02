@@ -2,6 +2,7 @@
 name = "boot-cli"
 version = "2026.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [[bin]]
 name = "boot"
@@ -24,5 +25,7 @@ boot-api-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

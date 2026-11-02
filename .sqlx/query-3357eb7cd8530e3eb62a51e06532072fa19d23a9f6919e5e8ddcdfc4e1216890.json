@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "3357eb7cd8530e3eb62a51e06532072fa19d23a9f6919e5e8ddcdfc4e1216890"
+}

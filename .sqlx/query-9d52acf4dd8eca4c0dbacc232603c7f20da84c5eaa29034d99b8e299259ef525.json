@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!\", name AS \"name!\", token_hash AS \"token_hash!\",\n                    scopes AS \"scopes!\", created_at AS \"created_at!\", expires_at\n             FROM tokens WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "name!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "token_hash!",
+        "ordinal": 2,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "token_hash"
+          }
+        }
+      },
+      {
+        "name": "scopes!",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "scopes"
+          }
+        }
+      },
+      {
+        "name": "created_at!",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "expires_at",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "tokens",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9d52acf4dd8eca4c0dbacc232603c7f20da84c5eaa29034d99b8e299259ef525"
+}

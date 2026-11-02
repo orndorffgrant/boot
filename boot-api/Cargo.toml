@@ -2,13 +2,16 @@
 name = "boot-api"
 version = "2026.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = { workspace = true, optional = true }
+async-trait.workspace = true
+base64.workspace = true
 clap = { workspace = true, optional = true }
 thiserror = { version = "2.0", optional = true }
 dropshot.workspace = true
+directories.workspace = true
 http.workspace = true
 probe-rs = { workspace = true, optional = true }
 probe-rs-debug = { workspace = true, optional = true }
@@ -18,6 +21,10 @@ serde.workspace = true
 serde_json.workspace = true
 serialport = { workspace = true, optional = true }
 os_pipe = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+sha2.workspace = true
+slog.workspace = true
+sqlx = { workspace = true, optional = true }
 time = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
 tokio.workspace = true
@@ -31,4 +38,4 @@ svd-parser = { workspace = true, optional = true }
 
 [features]
 default = ["run"]
-run = ["probe-rs", "probe-rs-debug", "base64", "serialport", "tokio-tungstenite", "tokio-util", "schemafy", "addr2line", "capstone", "svd-parser", "os_pipe", "time", "tracing", "clap", "thiserror"]
+run = ["probe-rs", "probe-rs-debug", "serialport", "tokio-tungstenite", "tokio-util", "schemafy", "addr2line", "capstone", "svd-parser", "os_pipe", "rand", "sqlx", "time", "tracing", "clap", "thiserror"]

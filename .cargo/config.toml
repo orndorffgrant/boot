@@ -1,0 +1,5 @@
+[env]
+# Use the committed `.sqlx` query cache so normal builds do not require a live
+# database. To check queries against a live schema while developing, run:
+#   SQLX_OFFLINE=false DATABASE_URL=sqlite:///path/to/schema.sqlite3 cargo check
+SQLX_OFFLINE = "true"
