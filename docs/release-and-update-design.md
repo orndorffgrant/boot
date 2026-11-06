@@ -1,7 +1,8 @@
 # Release and Update Mechanism — Design
 
-Status: draft for review
+Status: implemented
 Decisions resolved: 2026-11-04
+Implemented: 2026-11-05
 
 ## Summary
 
@@ -17,8 +18,8 @@ The design covers:
 - update discovery, replacement, service restart, and rollback behavior;
 - operational and security caveats.
 
-This is a design document only. No release workflow or update command is
-implemented yet.
+The release workflow, update command, and release helper are implemented. See
+[releases.md](releases.md) for user-facing instructions.
 
 ## Goals
 
@@ -314,9 +315,9 @@ Before making changes, the command must warn that:
 | Updating all configured servers over HTTP | Expands scope and requires remote privilege/authentication design |
 | In-place write to the executable | Can fail with `ETXTBSY`; rename is safer |
 
-## Proposed implementation outline
+## Implementation outline
 
-No code is included in this design, but the expected shape is:
+The implementation lives in:
 
 ```text
 .github/workflows/release.yml       tag validation, tests, builds, publish

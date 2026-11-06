@@ -9,9 +9,10 @@ mod probe;
 mod serial_port;
 mod server;
 mod systemd_service;
+mod update;
 
 #[derive(Parser)]
-#[command(name = "boot")]
+#[command(name = "boot", version)]
 struct CLI {
     /// Path to the CLI database (defaults to BOOT_CLI_DB or the boot data directory)
     #[arg(long, global = true, value_name = "PATH")]

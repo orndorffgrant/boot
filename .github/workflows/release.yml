@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and workspace version
+        id: meta
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if not tag.startswith("v"):
+              sys.exit(f"release tag '{tag}' must start with 'v'")
+
+          version = tag[1:]
+          semver = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)"
+              r"(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+              r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+          )
+          match = semver.match(version)
+          if not match:
+              sys.exit(f"release tag '{tag}' is not valid semver")
+
+          with open("Cargo.toml", "rb") as handle:
+              manifest = tomllib.load(handle)
+          workspace_version = manifest["workspace"]["package"]["version"]
+          if version != workspace_version:
+              sys.exit(
+                  f"tag version {version} does not match workspace version "
+                  f"{workspace_version}"
+              )
+
+          prerelease = "true" if match.group(4) else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+              output.write(f"prerelease={prerelease}\n")
+          PY
+
+      - name: Require the tag to be reachable from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"
+
+  test:
+    name: Test
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary
+        run: cross build --release --locked --target ${{ matrix.target }} -p boot-cli
+
+      - name: Package binary and checksum
+        run: |
+          cp "target/${{ matrix.target }}/release/boot" "boot-${{ matrix.target }}"
+          sha256sum "boot-${{ matrix.target }}" > "boot-${{ matrix.target }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ matrix.target }}
+          path: |
+            boot-${{ matrix.target }}
+            boot-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [validate, build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          overwrite_files: true
+          files: dist/*

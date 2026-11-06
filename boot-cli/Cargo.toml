@@ -1,6 +1,6 @@
 [package]
 name = "boot-cli"
-version = "2026.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 
@@ -23,8 +23,10 @@ object.workspace = true
 boot-api = { workspace = true, features = ["run"] }
 boot-api-client.workspace = true
 reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true

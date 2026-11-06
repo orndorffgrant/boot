@@ -33,6 +33,9 @@ pub enum AdminCommand {
     /// Revoke one token or all tokens
     #[command(name = "revoke-token")]
     RevokeToken(RevokeTokenArgs),
+    /// Update the locally installed boot binary
+    #[command(name = "update")]
+    Update(crate::update::UpdateArgs),
 }
 
 #[derive(Args)]
@@ -78,6 +81,14 @@ pub async fn admin(args: AdminArgs, cli_db: Option<&Path>, api_db: Option<&Path>
         AdminCommand::ListTokens => list_tokens(args.server.as_deref(), cli_db, api_db).await,
         AdminCommand::RevokeToken(revoke) => {
             revoke_token(args.server.as_deref(), revoke, cli_db, api_db).await
+        }
+        AdminCommand::Update(update) => {
+            if args.server.is_some() {
+                anyhow::bail!(
+                    "boot admin update only updates the local host; --server is not supported"
+                );
+            }
+            crate::update::update(update).await
         }
     }
 }
@@ -341,7 +352,7 @@ fn format_timestamp(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-fn confirm(prompt: &str, yes: bool) -> Result<()> {
+pub(crate) fn confirm(prompt: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
