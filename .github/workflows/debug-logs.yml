@@ -18,15 +18,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           curl -sS -L \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/orndorffgrant/boot/actions/jobs/128104728533/logs" \
             -o job.zip
+          echo "curl exit: $?"
           file job.zip
-          unzip -o job.zip -d logs || true
+          unzip -o job.zip -d logs
+          echo "unzip exit: $?"
           find logs -maxdepth 2 -type f -print
-          cat logs/* > failed.log || true
+          cat logs/* > failed.log 2>/dev/null
+          cat job.zip >> failed.log
           wc -c failed.log
 
       - name: Publish logs as a check run
