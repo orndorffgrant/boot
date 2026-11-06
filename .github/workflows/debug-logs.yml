@@ -1,0 +1,41 @@
+name: Debug failed release logs
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  checks: write
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download failed logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run view 42279562360 --log-failed > failed.log || true
+          wc -c failed.log
+
+      - name: Publish logs as a check run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const log = fs.readFileSync('failed.log', 'utf8');
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'debug-failed-logs',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: 'neutral',
+              output: {
+                title: 'Failed release logs',
+                summary: log.slice(-60000) || '(no log output)',
+              },
+            });
