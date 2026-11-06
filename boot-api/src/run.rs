@@ -482,15 +482,21 @@ mod tests {
             )
             .await;
 
+        // Use a valid body so the result depends on the token scope rather than
+        // on the order in which the framework parses the body and checks auth.
         server
             .send(
-                server.request(Method::POST, "/v1/probes/foo", Some(&read), "{}"),
+                server.request(
+                    Method::POST,
+                    "/v1/probes/foo",
+                    Some(&read),
+                    r#"{"elf_data":""}"#,
+                ),
                 StatusCode::FORBIDDEN,
             )
             .await;
 
-        // Auth runs before body parsing: a control token with a bad body gets
-        // 400, not 401.
+        // A control token with a bad body gets 400, not 401.
         server
             .send(
                 server.request(Method::POST, "/v1/probes/foo", Some(&control), ""),
