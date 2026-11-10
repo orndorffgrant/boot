@@ -1,5 +1,11 @@
 # Authentication for `boot-api`
 
+> **Update 2026-11-09:** The runtime architecture now reuses `boot.sqlite3` for
+> session/change metadata and bounded change logs. Token hashes remain the only
+> credential material; plaintext tokens and session payload bytes are still not
+> stored in this database. See
+> [api-architecture-design.md](api-architecture-design.md) section 14.
+
 **Status:** Proposed  
 **Date:** 2026-10-28  
 **Revision:** 10 — Per-request token lookup; credentials merged into servers
