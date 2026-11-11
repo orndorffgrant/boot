@@ -1,4 +1,5 @@
 use dropshot::HttpError;
+use dropshot::HttpResponseAccepted;
 use dropshot::HttpResponseCreated;
 use dropshot::HttpResponseHeaders;
 use dropshot::HttpResponseOk;
@@ -14,60 +15,27 @@ use serde::{Deserialize, Serialize};
 pub mod auth;
 
 #[cfg(feature = "run")]
-pub mod api_db;
+mod runtime;
 #[cfg(feature = "run")]
-mod probe;
-#[cfg(feature = "run")]
-mod probe_dap;
+pub mod store;
+
 #[cfg(feature = "run")]
 mod run;
 #[cfg(feature = "run")]
-mod serial_port;
-#[cfg(feature = "run")]
 pub use run::{RunOptions, is_loopback_host, run};
+#[cfg(feature = "run")]
+pub use runtime::{Runtime, RuntimeConfig};
+
+pub use boot_protocol::*;
 
 use auth::{Admin, Auth, Control, Read};
 
 #[derive(Serialize, JsonSchema)]
 pub struct Empty {}
 
-#[derive(Serialize, JsonSchema)]
-pub struct Probe {
+#[derive(Deserialize, JsonSchema)]
+pub struct IdPath {
     pub id: String,
-    pub name: String,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub serial_number: Option<String>,
-    pub hid_interface: Option<u8>,
-    pub probe_type: String,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct Target {
-    pub name: String,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub struct SerialPort {
-    pub id: String,
-    pub path: String,
-    pub name: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct SelectorPath {
-    pub selector: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct SelectorAndRttPath {
-    pub selector: String,
-    pub rtt_addr: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct PortIdPath {
-    pub port_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -76,8 +44,61 @@ pub struct TokenPath {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct FlashRequest {
-    pub elf_data: String,
+pub struct ArtifactPath {
+    pub id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SubscriberPath {
+    pub id: String,
+    pub subscriber_id: String,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub select: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct DeleteSessionQuery {
+    #[serde(default)]
+    pub purge: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct FollowQuery {
+    #[serde(default)]
+    pub after: Option<u64>,
+    #[serde(default)]
+    pub include_input: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ExportQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub channel: Option<u8>,
+    #[serde(default)]
+    pub include_input: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct IoQuery {
+    #[serde(default)]
+    pub after: Option<u64>,
+    #[serde(default)]
+    pub replay: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub include_input: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AbortRequest {
+    pub action: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -135,7 +156,16 @@ trait BootApi {
     }]
     async fn health(
         rqctx: RequestContext<Self::Context>,
-    ) -> Result<HttpResponseOk<Empty>, HttpError>;
+    ) -> Result<HttpResponseOk<ServerStatus>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/server",
+    }]
+    async fn server(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+    ) -> Result<HttpResponseOk<ServerStatus>, HttpError>;
 
     #[endpoint {
         method = GET,
@@ -148,12 +178,256 @@ trait BootApi {
 
     #[endpoint {
         method = GET,
+        path = "/v1/probes/{id}",
+    }]
+    async fn probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Probe>, HttpError>;
+
+    #[endpoint {
+        method = GET,
         path = "/v1/serial-ports",
     }]
     async fn serial_ports(
         rqctx: RequestContext<Self::Context>,
         _auth: Auth<Read>,
     ) -> Result<HttpResponseOk<Vec<SerialPort>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/serial-ports/{id}",
+    }]
+    async fn serial_port(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<SerialPort>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/probes/{id}/flash",
+    }]
+    async fn flash_probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<FlashRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/probes/{id}/reset",
+    }]
+    async fn reset_probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<ResetRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/probes/{id}/inspect",
+    }]
+    async fn inspect_probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<InspectRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/changes",
+    }]
+    async fn list_changes(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        query: Query<ListQuery>,
+    ) -> Result<HttpResponseOk<Vec<Change>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/changes/{id}",
+    }]
+    async fn get_change(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Change>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/changes/{id}/follow",
+    }]
+    async fn follow_change(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        query: Query<FollowQuery>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/changes/{id}",
+    }]
+    async fn abort_change(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<AbortRequest>,
+    ) -> Result<HttpResponseOk<Change>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/probes/{id}/sessions",
+    }]
+    async fn create_probe_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<ProbeSessionRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/serial-ports/{id}/sessions",
+    }]
+    async fn create_serial_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<SerialSessionRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/sessions",
+    }]
+    async fn list_sessions(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        query: Query<ListQuery>,
+    ) -> Result<HttpResponseOk<Vec<Session>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/sessions/{id}",
+    }]
+    async fn get_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    #[endpoint {
+        method = PATCH,
+        path = "/v1/sessions/{id}",
+    }]
+    async fn patch_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<SessionPatch>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/sessions/{id}/resume",
+    }]
+    async fn resume_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    #[endpoint {
+        method = DELETE,
+        path = "/v1/sessions/{id}",
+    }]
+    async fn delete_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        query: Query<DeleteSessionQuery>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/sessions/{id}/subscribers",
+    }]
+    async fn list_subscribers(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Vec<Subscriber>>, HttpError>;
+
+    #[endpoint {
+        method = DELETE,
+        path = "/v1/sessions/{id}/subscribers/{subscriber_id}",
+    }]
+    async fn kick_subscriber(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<SubscriberPath>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/sessions/{id}/io",
+    }]
+    async fn session_io(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        query: Query<IoQuery>,
+        upgraded: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/sessions/{id}/export",
+    }]
+    async fn export_session(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        query: Query<ExportQuery>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<dropshot::FreeformBody>>, HttpError>;
+
+    #[endpoint {
+        method = POST,
+        path = "/v1/artifacts",
+        request_body_max_bytes = 67108864,
+    }]
+    async fn create_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        body: dropshot::StreamingBody,
+    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Artifact>>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/artifacts/{id}",
+    }]
+    async fn get_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<ArtifactPath>,
+    ) -> Result<HttpResponseOk<Artifact>, HttpError>;
+
+    #[endpoint {
+        method = DELETE,
+        path = "/v1/artifacts/{id}",
+    }]
+    async fn delete_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<ArtifactPath>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError>;
 
     #[endpoint {
         method = GET,
@@ -193,72 +467,6 @@ trait BootApi {
         _auth: Auth<Admin>,
         query: Query<RevokeAllQuery>,
     ) -> Result<HttpResponseOk<RevokeResult>, HttpError>;
-
-    #[endpoint {
-        method = GET,
-        path = "/v1/probes/{selector}/target",
-    }]
-    async fn probes_target(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<SelectorPath>,
-    ) -> Result<HttpResponseOk<Target>, HttpError>;
-
-    #[endpoint {
-        method = POST,
-        path = "/v1/probes/{selector}",
-        request_body_max_bytes = 10485760, // 10 MB for ELF files
-    }]
-    async fn flash_and_run(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<SelectorPath>,
-        body: TypedBody<FlashRequest>,
-    ) -> Result<HttpResponseOk<Empty>, HttpError>;
-
-    #[endpoint {
-        method = GET,
-        path = "/v1/serial-ports/{port_id}/shell",
-    }]
-    async fn serial_shell(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<PortIdPath>,
-        upgraded: WebsocketUpgrade,
-    ) -> WebsocketEndpointResult;
-
-    #[endpoint {
-        method = GET,
-        path = "/v1/probes/{selector}/attach",
-    }]
-    async fn probe_attach(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<SelectorPath>,
-        upgraded: WebsocketUpgrade,
-    ) -> WebsocketEndpointResult;
-
-    #[endpoint {
-        method = GET,
-        path = "/v1/probes/{selector}/attach/{rtt_addr}",
-    }]
-    async fn probe_attach_with_rtt(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<SelectorAndRttPath>,
-        upgraded: WebsocketUpgrade,
-    ) -> WebsocketEndpointResult;
-
-    #[endpoint {
-        method = GET,
-        path = "/v1/probes/{selector}/dap",
-    }]
-    async fn probe_dap(
-        rqctx: RequestContext<Self::Context>,
-        _auth: Auth<Control>,
-        path: Path<SelectorPath>,
-        upgraded: WebsocketUpgrade,
-    ) -> WebsocketEndpointResult;
 }
 
 pub fn openapi() -> String {
@@ -304,9 +512,6 @@ fn apply_security(document: &mut serde_json::Value) {
                     .entry("responses")
                     .or_insert_with(|| serde_json::json!({}));
                 if let Some(responses) = responses.as_object_mut() {
-                    // Reference the same error body type as Dropshot's
-                    // generated 4XX response so generated clients have a
-                    // single error type for the operation.
                     responses.entry("401").or_insert_with(
                         || serde_json::json!({ "$ref": "#/components/responses/Error" }),
                     );

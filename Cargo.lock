@@ -352,6 +352,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "boot-protocol",
  "capstone",
  "clap",
  "directories",
@@ -386,6 +387,7 @@ version = "2026.1106.0"
 dependencies = [
  "base64 0.23.1",
  "boot-api",
+ "boot-protocol",
  "futures",
  "prettyplease",
  "progenitor",
@@ -405,6 +407,7 @@ dependencies = [
  "base64 0.23.1",
  "boot-api",
  "boot-api-client",
+ "boot-protocol",
  "clap",
  "comfy-table",
  "defmt-decoder",
@@ -423,6 +426,15 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "boot-protocol"
+version = "2026.1106.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

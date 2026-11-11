@@ -8,6 +8,7 @@ mod cli_db;
 mod probe;
 mod serial_port;
 mod server;
+mod session;
 mod systemd_service;
 mod update;
 
@@ -96,6 +97,19 @@ enum Command {
     #[command(name = "serial-shell")]
     SerialShell(serial_port::SerialShellArgs),
 
+    // Sessions
+    /// List live and retained sessions
+    #[command(name = "list-sessions")]
+    ListSessions,
+
+    /// Replay a retained session
+    #[command(name = "session-replay")]
+    SessionReplay(session::SessionReplayArgs),
+
+    /// Export a retained session as asciicast v3
+    #[command(name = "session-export")]
+    SessionExport(session::SessionExportArgs),
+
     // Other
     /// Print the OpenAPI specification
     #[command(name = "api-desc")]
@@ -124,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
         Command::StartProbeDap(args) => probe::start_probe_dap(args, cli_db).await,
         Command::ListSerialPorts => serial_port::list_serial_ports(cli_db).await,
         Command::SerialShell(args) => serial_port::serial_shell(args, cli_db).await,
+        Command::ListSessions => session::list_sessions(cli_db).await,
+        Command::SessionReplay(args) => session::replay_session(args, cli_db).await,
+        Command::SessionExport(args) => session::export_session(args, cli_db).await,
         Command::APIDesc => api_desc().await,
     }
 }

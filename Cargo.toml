@@ -4,6 +4,7 @@ members = [
     "boot-api",
     "boot-api-client",
     "boot-cli",
+    "boot-protocol",
 ]
 
 [workspace.package]
@@ -59,3 +60,4 @@ tokio-tungstenite = "0.30"
 # Workspace crates
 boot-api = { path = "boot-api", default-features = false }
 boot-api-client = { path = "boot-api-client" }
+boot-protocol = { path = "boot-protocol" }

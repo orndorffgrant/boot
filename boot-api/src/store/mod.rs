@@ -1,7 +1,8 @@
-//! SQLite storage for API token hashes.
+//! SQLite storage for the API database.
 //!
-//! The API database is opened read-write by both the server and the CLI. It
-//! contains only SHA-256 token hashes, never plaintext credentials.
+//! The database is opened read-write by both the server and the CLI. It contains
+//! SHA-256 token hashes (never plaintext credentials) plus runtime metadata for
+//! sessions, changes, and artifacts.
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -131,12 +132,20 @@ async fn ensure_application_id_pool(pool: &SqlitePool) -> Result<()> {
     )
 }
 
-/// Handle to the API database.
-pub struct ApiDb {
+pub mod runtime;
+
+pub use runtime::*;
+
+/// Handle to the shared API database.
+pub struct Store {
     pool: SqlitePool,
 }
 
-impl ApiDb {
+impl Store {
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Open (creating if necessary) and migrate the API database.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -296,7 +305,7 @@ impl TokenRow {
 }
 
 #[async_trait::async_trait]
-impl TokenStore for ApiDb {
+impl TokenStore for Store {
     async fn find_token_by_hash(&self, hash: &[u8; 32]) -> Result<Option<TokenRecord>, StoreError> {
         let row = sqlx::query_as!(
             TokenRow,
@@ -326,7 +335,7 @@ impl TokenStore for ApiDb {
     }
 
     async fn create_token(&self, request: CreateTokenRequest) -> Result<CreatedToken, StoreError> {
-        ApiDb::create_token(self, request).await
+        Store::create_token(self, request).await
     }
 
     async fn list_tokens(&self) -> Result<Vec<TokenRecord>, StoreError> {
@@ -383,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn token_round_trip_stores_only_a_hash() {
         let path = temp_path("round-trip");
-        let db = ApiDb::open(&path).await.unwrap();
+        let db = Store::open(&path).await.unwrap();
         let created = db
             .create_token(CreateTokenRequest {
                 name: "laptop".to_string(),
@@ -420,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_names_and_replace_are_atomic() {
         let path = temp_path("replace");
-        let db = ApiDb::open(&path).await.unwrap();
+        let db = Store::open(&path).await.unwrap();
         let request = |replace| CreateTokenRequest {
             name: "ci".to_string(),
             scopes: Scopes::read(),
@@ -446,7 +455,7 @@ mod tests {
     async fn schema_is_idempotent_and_newer_versions_fail() {
         let path = temp_path("schema");
         {
-            let db = ApiDb::open(&path).await.unwrap();
+            let db = Store::open(&path).await.unwrap();
             let _ = db
                 .create_token(CreateTokenRequest {
                     name: "local".to_string(),
@@ -456,7 +465,7 @@ mod tests {
                 })
                 .await;
         }
-        let db = ApiDb::open(&path).await.unwrap();
+        let db = Store::open(&path).await.unwrap();
         assert_eq!(db.token_count().await.unwrap(), 1);
         sqlx::query(
             "INSERT INTO _sqlx_migrations
@@ -466,13 +475,13 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        assert!(ApiDb::open(&path).await.is_err());
+        assert!(Store::open(&path).await.is_err());
     }
 
     #[tokio::test]
     async fn names_are_bound_parameters() {
         let path = temp_path("sql");
-        let db = ApiDb::open(&path).await.unwrap();
+        let db = Store::open(&path).await.unwrap();
         let name = "x'); DROP TABLE tokens; --";
         db.create_token(CreateTokenRequest {
             name: name.to_string(),
@@ -503,9 +512,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = temp_path("permissions");
-        ApiDb::open(&path).await.unwrap();
+        Store::open(&path).await.unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let error = match ApiDb::open(&path).await {
+        let error = match Store::open(&path).await {
             Ok(_) => panic!("group-readable database was accepted"),
             Err(error) => error.to_string(),
         };
@@ -517,7 +526,7 @@ mod tests {
         use sqlx::{Connection, SqliteConnection};
 
         let path = temp_path("app-id");
-        drop(ApiDb::open(&path).await.unwrap());
+        drop(Store::open(&path).await.unwrap());
         let mut connection = SqliteConnection::connect_with(&writer_options(&path))
             .await
             .unwrap();
@@ -526,6 +535,6 @@ mod tests {
             .await
             .unwrap();
         drop(connection);
-        assert!(ApiDb::open(&path).await.is_err());
+        assert!(Store::open(&path).await.is_err());
     }
 }

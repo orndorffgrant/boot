@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+boot-protocol.workspace = true
 futures.workspace = true
 progenitor-client.workspace = true
 rand.workspace = true

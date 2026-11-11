@@ -7,8 +7,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
-use boot_api::api_db::{ApiDb, resolve_api_db_path};
 use boot_api::auth::{CreateTokenRequest, Scopes, TokenRecord, TokenStore};
+use boot_api::store::{Store, resolve_api_db_path};
 
 use crate::auth::{api_client, map_error};
 use crate::cli_db::{CliDb, ServerEntry};
@@ -196,7 +196,7 @@ async fn create_token(
         )
     } else {
         let path = resolve_api_db_path(api_db)?;
-        let db = ApiDb::open(&path).await?;
+        let db = Store::open(&path).await?;
         let expires_at = match expires_in {
             Some(seconds) => Some(
                 unix_now()
@@ -298,7 +298,7 @@ async fn list_tokens(
             .collect();
     } else {
         let path = resolve_api_db_path(api_db)?;
-        let db = ApiDb::open(&path).await?;
+        let db = Store::open(&path).await?;
         tokens = db
             .list_tokens()
             .await
@@ -458,7 +458,7 @@ async fn revoke_token(
         }
     } else {
         let path = resolve_api_db_path(api_db)?;
-        let db = ApiDb::open(&path).await?;
+        let db = Store::open(&path).await?;
         let result = if args.all {
             db.revoke_all().await
         } else {

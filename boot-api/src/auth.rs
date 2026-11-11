@@ -327,11 +327,32 @@ pub trait TokenStore: Send + Sync {
 #[derive(Clone)]
 pub struct AuthState {
     store: Arc<dyn TokenStore>,
+    #[cfg(feature = "run")]
+    runtime: Option<crate::Runtime>,
 }
 
 impl AuthState {
     pub fn new(store: Arc<dyn TokenStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(feature = "run")]
+            runtime: None,
+        }
+    }
+
+    #[cfg(feature = "run")]
+    pub fn new_with_runtime(store: Arc<dyn TokenStore>, runtime: crate::Runtime) -> Self {
+        Self {
+            store,
+            runtime: Some(runtime),
+        }
+    }
+
+    #[cfg(feature = "run")]
+    pub fn runtime(&self) -> Result<&crate::Runtime, String> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| "runtime is not available".to_string())
     }
 
     pub fn store(&self) -> &Arc<dyn TokenStore> {

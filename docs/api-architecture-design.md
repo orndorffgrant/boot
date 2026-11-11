@@ -595,7 +595,6 @@ boot-api/src/
   openapi.rs                       # security scheme and spec post-processing
   run.rs                           # bootstrap: runtime, shared DB, Dropshot
   auth.rs                          # existing tokens, scopes, Auth<S> extractor
-  api_db.rs                        # compatibility shim over store::Store
   api/
     mod.rs
     state.rs                       # ApiState { auth, runtime, config }
@@ -1786,9 +1785,8 @@ Rationale:
 - Do not add a single `Store` trait with every method. It would couple auth to
   runtime schema and make fakes noisy.
 
-`store::Store` is the production implementation; `api_db.rs` becomes a thin
-compatibility re-export. The CLI opens the same store for token administration
-and runs the same migrations.
+`store::Store` is the production implementation. The CLI opens the same store
+for token administration and runs the same migrations.
 
 ### 14.2 Storage layout
 
@@ -1831,9 +1829,9 @@ later cause contention, revisit WAL with measurements; do not switch blindly.
 Paths are overridable with the existing `--api-db`/`BOOT_API_DB` and a new
 `--session-dir`/`BOOT_SESSION_DIR`. There is no separate `--state-db`.
 
-This changes `boot-api/src/api_db.rs` from a token-only store into the shared
-database handle: one pool, one migration set, and both `TokenStore` and
-`RuntimeStore` implemented over it. Add a `0002_runtime.sql` migration.
+This makes `boot-api/src/store/` the shared database handle: one pool, one
+initial migration set, and both `TokenStore` and `RuntimeStore` implemented over
+it. Extend the initial migration rather than adding a follow-up migration.
 
 [authentication.md](authentication.md) must be updated: the API DB is no longer
 token-only. It now also contains session/change metadata and bounded change logs.
@@ -1842,7 +1840,7 @@ It still contains no plaintext tokens and no session payload bytes.
 ### 14.3 Session metadata schema
 
 ```sql
--- Added by migrations/0002_runtime.sql to the existing boot.sqlite3.
+-- Included in the initial migration for the shared boot.sqlite3.
 -- application_id remains 0x424F4F54 ("BOOT"); do not change it.
 
 CREATE TABLE sessions (

@@ -5,9 +5,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
 
-use boot_api::api_db::ApiDb;
-use boot_api::api_db::resolve_api_db_path;
 use boot_api::auth::{CreateTokenRequest, Scopes};
+use boot_api::store::{Store, resolve_api_db_path};
 
 use crate::auth::{self, SetTokenArgs, TokenSourceArgs};
 use crate::cli_db::{CliDb, resolve_cli_db_path};
@@ -127,7 +126,7 @@ async fn prepare(
     let api_db_path = resolve_api_db_path(api_db)?;
     let cli_db_path = resolve_cli_db_path(cli_db)?;
 
-    let db = ApiDb::open(&api_db_path)
+    let db = Store::open(&api_db_path)
         .await
         .with_context(|| format!("Failed to open API database {}", api_db_path.display()))?;
     let config = CliDb::open(&cli_db_path).await?;
