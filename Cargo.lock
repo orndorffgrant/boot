@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "boot-api"
-version = "2026.1106.0"
+version = "2026.1111.0"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "boot-api-client"
-version = "2026.1106.0"
+version = "2026.1111.0"
 dependencies = [
  "base64 0.23.1",
  "boot-api",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "boot-cli"
-version = "2026.1106.0"
+version = "2026.1111.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "boot-protocol"
-version = "2026.1106.0"
+version = "2026.1111.0"
 dependencies = [
  "schemars",
  "serde",
