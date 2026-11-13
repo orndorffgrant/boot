@@ -8,7 +8,7 @@ Implemented: 2026-11-05
 
 Publish `boot` binaries from Git tags using GitHub Actions and GitHub
 Releases, then let an installed `boot` replace itself with
-`boot admin update`.
+`boot update`.
 
 The design covers:
 
@@ -25,7 +25,7 @@ The release workflow, update command, and release helper are implemented. See
 
 - One command cuts a release and one tag push publishes it.
 - Releases are reproducible enough to rebuild or audit from source.
-- `boot admin update` is safe by default: it verifies the download, validates
+- `boot update` is safe by default: it verifies the download, validates
   that the new binary can run, and rolls back if the service fails to restart.
 - Calendar versions are readable and sort correctly.
 - The release process needs no long-lived repository secrets beyond the
@@ -40,7 +40,7 @@ The release workflow, update command, and release helper are implemented. See
 - Delta updates.
 - Automatic background update checks or unattended upgrades.
 - Windows, macOS, musl, or non-glibc targets.
-- Replacing the existing token administration behavior of `boot admin`.
+- Replacing or changing token administration behavior.
 
 ## Versioning
 
@@ -171,12 +171,11 @@ the asset naming should include the version.
 
 ### Command surface
 
-Proposed location: `boot admin update`, since it is an administrative
-operation on the local installation.
+Location: `boot update`, since it operates on the local installation.
 
 ```text
-boot admin update [--check] [--version TAG] [--force] [--yes]
-                  [--no-restart] [--repo OWNER/REPO]
+boot update [--check] [--version TAG] [--force] [--yes]
+            [--no-restart] [--repo OWNER/REPO]
 ```
 
 | Flag | Behavior |
@@ -290,7 +289,7 @@ Before making changes, the command must warn that:
 
 ## Operational considerations
 
-- `boot admin update` updates the local host only. Run it on every host.
+- `boot update` updates the local host only. Run it on every host.
 - Invoke the installed binary path that systemd uses; otherwise the update may
   replace a different copy.
 - Keep the release workflow and updater target list in sync. Adding a target
@@ -324,7 +323,7 @@ The implementation lives in:
 tools/release.sh                    optional CalVer bump/commit/tag helper
 boot-cli/src/update.rs              update command implementation
 boot-cli/src/systemd_service.rs     service activity and executable discovery
-boot-cli/src/admin.rs               wire `admin update` into the CLI
+boot-cli/src/main.rs                wire `boot update` into the CLI
 docs/releases.md                    user-facing release/update instructions
 ```
 
@@ -341,7 +340,7 @@ Supporting changes:
 | --- | --- |
 | Tag branch policy | Tags must point at a commit reachable from the default branch. |
 | Backup retention | Keep the previous binary only during the swap; remove it after success. |
-| Update scope | `boot admin update` updates the local host only. |
+| Update scope | `boot update` updates the local host only. |
 | Default repository | Default to `orndorffgrant/boot`, overridable with `--repo` or `BOOT_RELEASE_REPO`. |
 | Artifact attestations | Use SHA-256 checksums only for now; no attestations. |
 | CalVer boundary | Evaluate the date and same-day counter in UTC. |
@@ -352,7 +351,7 @@ Supporting changes:
 2. Add the release workflow and verify it with a pre-release tag such as
    `v2026.1103.0-rc.1`.
 3. Verify both assets and checksums can be downloaded manually.
-4. Implement `boot admin update --check` and validate version discovery.
+4. Implement `boot update --check` and validate version discovery.
 5. Implement the install path, then test successful update, checksum failure,
    non-writable directory, and restart-failure rollback on a disposable host.
 6. Publish the first stable release and document it.

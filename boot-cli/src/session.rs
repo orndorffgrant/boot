@@ -8,7 +8,7 @@ use crate::auth::{api_client, map_error};
 use crate::cli_db::CliDb;
 
 #[derive(Args)]
-pub struct SessionReplayArgs {
+pub struct ReplaySessionArgs {
     /// Server name and session ID in format: {server-name}/{session-id}
     pub server_and_session: String,
     /// Start replaying after this data sequence
@@ -79,7 +79,7 @@ async fn upgraded_to_websocket(
 }
 
 pub async fn replay_session(
-    args: SessionReplayArgs,
+    args: ReplaySessionArgs,
     cli_db: Option<&std::path::Path>,
 ) -> Result<()> {
     let parts: Vec<&str> = args.server_and_session.splitn(2, '/').collect();
@@ -141,7 +141,7 @@ pub async fn replay_session(
 }
 
 #[derive(Args)]
-pub struct SessionExportArgs {
+pub struct ExportSessionArgs {
     /// Server name and session ID in format: {server-name}/{session-id}
     pub server_and_session: String,
     /// Output file (.cast)
@@ -156,7 +156,7 @@ pub struct SessionExportArgs {
 }
 
 pub async fn export_session(
-    args: SessionExportArgs,
+    args: ExportSessionArgs,
     cli_db: Option<&std::path::Path>,
 ) -> Result<()> {
     let parts: Vec<&str> = args.server_and_session.splitn(2, '/').collect();

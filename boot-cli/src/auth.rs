@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
-use crate::cli_db::{CliDb, ServerEntry};
+use crate::cli_db::ServerEntry;
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct TokenSourceArgs {
@@ -24,6 +24,10 @@ pub struct TokenSourceArgs {
 }
 
 impl TokenSourceArgs {
+    pub fn is_empty(&self) -> bool {
+        !self.token_stdin && self.token_file.is_none() && self.token.is_none()
+    }
+
     pub fn read(&self) -> Result<Option<String>> {
         let mut sources = 0;
         if self.token_stdin {
@@ -56,7 +60,7 @@ impl TokenSourceArgs {
     }
 }
 
-fn validate_token_input(mut token: String) -> Result<String> {
+pub(crate) fn validate_token_input(mut token: String) -> Result<String> {
     while token.ends_with('\n') || token.ends_with('\r') {
         token.pop();
     }
@@ -103,7 +107,7 @@ pub fn lookup_token(server: &ServerEntry) -> Result<Option<String>> {
 
 fn missing_token_error(server: &ServerEntry) -> anyhow::Error {
     anyhow::anyhow!(
-        "Server '{}' has no token. Run: boot set-token {} --token-stdin",
+        "Server '{}' has no token. Run: boot edit-server {} --token-stdin",
         server.name,
         server.name
     )
@@ -174,7 +178,7 @@ pub fn map_error(
 ) -> anyhow::Error {
     match status {
         Some(reqwest::StatusCode::UNAUTHORIZED) => anyhow::anyhow!(
-            "Server '{}' rejected the token. Run: boot set-token {} --token-stdin",
+            "Server '{}' rejected the token. Run: boot edit-server {} --token-stdin",
             server.name,
             server.name
         ),
@@ -192,26 +196,4 @@ pub fn map_error(
         }
         _ => anyhow::anyhow!("{}", error),
     }
-}
-
-#[derive(Args)]
-pub struct SetTokenArgs {
-    /// Server name
-    pub server: String,
-    #[command(flatten)]
-    pub token_source: TokenSourceArgs,
-}
-
-pub async fn set_token(args: SetTokenArgs, cli_db: Option<&Path>) -> Result<()> {
-    let config = CliDb::open_default(cli_db).await?;
-    if config.get_server(&args.server).await?.is_none() {
-        anyhow::bail!("Server '{}' not found", args.server);
-    }
-    let token = args
-        .token_source
-        .read()?
-        .ok_or_else(|| anyhow::anyhow!("No token supplied; use --token-stdin or --token-file"))?;
-    config.set_token(&args.server, &token).await?;
-    println!("Stored token for server '{}'", args.server);
-    Ok(())
 }

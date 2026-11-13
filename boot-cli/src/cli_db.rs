@@ -256,6 +256,60 @@ impl CliDb {
         Ok(())
     }
 
+    /// Update an existing server entry. `None` keeps a field unchanged,
+    /// `Some(None)` clears it, and `Some(Some(value))` sets it.
+    pub async fn update_server(
+        &self,
+        name: &str,
+        url: Option<&str>,
+        ca_cert: Option<Option<&str>>,
+        token: Option<Option<&str>>,
+    ) -> Result<()> {
+        if let Some(url) = url {
+            validate_url(url)?;
+        }
+        let now = now_unix();
+        let mut connection = self.pool.acquire().await?;
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query_as!(
+            ServerRow,
+            "SELECT name AS \"name!\", url AS \"url!\", ca_cert, token
+             FROM servers
+             WHERE name = ?",
+            name
+        )
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(ServerRow {
+            url: old_url,
+            ca_cert: old_ca_cert,
+            token: old_token,
+            ..
+        }) = existing
+        else {
+            bail!("Server '{}' not found", name);
+        };
+        let new_url = url.unwrap_or(&old_url);
+        let new_ca_cert = ca_cert
+            .map(|value| value.map(str::to_string))
+            .unwrap_or(old_ca_cert);
+        let new_token = token
+            .map(|value| value.map(str::to_string))
+            .unwrap_or(old_token);
+        sqlx::query(
+            "UPDATE servers SET url = ?, ca_cert = ?, token = ?, updated_at = ? WHERE name = ?",
+        )
+        .bind(new_url)
+        .bind(new_ca_cert)
+        .bind(new_token)
+        .bind(now)
+        .bind(name)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn set_token(&self, name: &str, token: &str) -> Result<()> {
         let now = now_unix();
         let result = sqlx::query!(
@@ -286,7 +340,7 @@ impl CliDb {
     }
 }
 
-fn validate_url(url: &str) -> Result<()> {
+pub(crate) fn validate_url(url: &str) -> Result<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("Server URL must start with http:// or https://");
     }
@@ -335,6 +389,41 @@ mod tests {
         let server = db.get_server("local").await.unwrap().unwrap();
         assert_eq!(server.url, "http://127.0.0.1:46674");
         assert_eq!(server.token.as_deref(), Some("token"));
+    }
+
+    #[tokio::test]
+    async fn update_server_keeps_clears_and_sets_fields() {
+        let db = CliDb::open(temp_path("update")).await.unwrap();
+        db.add_server(
+            "pi",
+            "http://127.0.0.1:46673",
+            Some("/tmp/ca.pem"),
+            Some("boot_v1_old"),
+        )
+        .await
+        .unwrap();
+
+        db.update_server("pi", Some("https://pi.local:46673"), None, None)
+            .await
+            .unwrap();
+        let server = db.get_server("pi").await.unwrap().unwrap();
+        assert_eq!(server.url, "https://pi.local:46673");
+        assert_eq!(server.ca_cert.as_deref(), Some("/tmp/ca.pem"));
+        assert_eq!(server.token.as_deref(), Some("boot_v1_old"));
+
+        db.update_server("pi", None, Some(None), Some(Some("boot_v1_new")))
+            .await
+            .unwrap();
+        let server = db.get_server("pi").await.unwrap().unwrap();
+        assert_eq!(server.ca_cert, None);
+        assert_eq!(server.token.as_deref(), Some("boot_v1_new"));
+
+        db.update_server("pi", None, None, Some(None))
+            .await
+            .unwrap();
+        let server = db.get_server("pi").await.unwrap().unwrap();
+        assert_eq!(server.token, None);
+        assert!(db.update_server("missing", None, None, None).await.is_err());
     }
 
     #[tokio::test]

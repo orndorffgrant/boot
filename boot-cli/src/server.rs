@@ -1,15 +1,20 @@
-use std::path::Path;
-use std::time::Duration;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Args;
 use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
+use serde::{Deserialize, Serialize};
 
 use boot_api::auth::{CreateTokenRequest, Scopes};
 use boot_api::store::{Store, resolve_api_db_path};
 
-use crate::auth::{self, SetTokenArgs, TokenSourceArgs};
-use crate::cli_db::{CliDb, resolve_cli_db_path};
+use crate::auth::{self, TokenSourceArgs};
+use crate::cli_db::{CliDb, ServerEntry, resolve_cli_db_path, validate_url};
 use crate::systemd_service::{self, ServiceConfig};
 
 #[derive(Args, Default)]
@@ -57,9 +62,29 @@ pub struct AddServerArgs {
 }
 
 #[derive(Args)]
-pub struct CheckAuthArgs {
+pub struct ShowServerArgs {
+    /// Server name (defaults to local)
+    pub name: Option<String>,
+}
+
+#[derive(Args, Default)]
+pub struct EditServerArgs {
     /// Server name
-    pub server: String,
+    pub name: String,
+    /// New connection URL
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// New PEM CA certificate
+    #[arg(long, value_name = "PATH", conflicts_with = "clear_ca_cert")]
+    pub ca_cert: Option<PathBuf>,
+    /// Remove the stored CA certificate
+    #[arg(long, conflicts_with = "ca_cert")]
+    pub clear_ca_cert: bool,
+    #[command(flatten)]
+    pub token_source: TokenSourceArgs,
+    /// Remove the stored token
+    #[arg(long, conflicts_with_all = ["token_stdin", "token_file", "token"])]
+    pub clear_token: bool,
 }
 
 pub async fn start_server(
@@ -170,7 +195,7 @@ async fn prepare(
                 Err(error) => {
                     eprintln!(
                         "Warning: created the local admin token but could not store it: {}. \
-                         Recover with:\n  boot admin create-token --name local-admin --scope admin \
+                         Recover with:\n  boot create-token --name local-admin --scope admin \
                          --save-to local",
                         error
                     );
@@ -183,14 +208,14 @@ async fn prepare(
         {
             eprintln!(
                 "Warning: the API database has tokens but no admin token. Create one with:\n  \
-                 boot admin create-token --name local-admin --scope admin\n  \
-                 boot set-token local --token-stdin"
+                 boot create-token --name local-admin --scope admin\n  \
+                 boot edit-server local --token-stdin"
             );
         } else if !has_credential {
             eprintln!(
                 "Warning: the local server entry has no stored credential. Use:\n  \
-                 boot admin create-token --name local-admin --scope admin --save-to local\n\
-                 or, if you have the secret:\n  boot set-token local --token-stdin"
+                 boot create-token --name local-admin --scope admin --save-to local\n\
+                 or, if you have the secret:\n  boot edit-server local --token-stdin"
             );
         }
     }
@@ -252,7 +277,7 @@ pub async fn add_server(args: AddServerArgs, cli_db: Option<&Path>) -> Result<()
     if token.is_none() {
         eprintln!(
             "Warning: no token supplied for '{}'. Protected commands will fail until you run: \
-             boot set-token {} --token-stdin",
+             boot edit-server {} --token-stdin",
             args.name, args.name
         );
     }
@@ -260,73 +285,288 @@ pub async fn add_server(args: AddServerArgs, cli_db: Option<&Path>) -> Result<()
     Ok(())
 }
 
-pub async fn set_token(args: SetTokenArgs, cli_db: Option<&Path>) -> Result<()> {
-    auth::set_token(args, cli_db).await
+pub async fn show_server(args: ShowServerArgs, cli_db: Option<&Path>) -> Result<()> {
+    let name = args.name.as_deref().unwrap_or("local");
+    let config = CliDb::open_default(cli_db).await?;
+    let server = config.get_server(name).await?;
+
+    match &server {
+        Some(server) => {
+            print_field("Name:", &server.name);
+            print_field("URL:", &server.url);
+        }
+        None if name == "local" => {
+            print_field("Name:", format!("{name} (not configured)"));
+        }
+        None => anyhow::bail!("Server '{}' not found", name),
+    }
+
+    if name == "local" {
+        let status = systemd_service::service_status()?.unwrap_or_else(|| "unknown".to_string());
+        let bind = systemd_service::service_bind()?.unwrap_or_else(|| "unknown".to_string());
+        print_field("Service:", status);
+        print_field("Bind:", bind);
+    }
+
+    if let Some(server) = server {
+        print_field("TLS:", if server.tls() { "https" } else { "http" });
+        print_field("CA:", server.ca_cert.as_deref().unwrap_or("none"));
+        print_field(
+            "Token:",
+            if server.token.is_some() {
+                "stored"
+            } else {
+                "missing"
+            },
+        );
+        print_auth_status(&server).await?;
+    }
+
+    Ok(())
 }
 
-pub async fn check_auth(args: CheckAuthArgs, cli_db: Option<&Path>) -> Result<()> {
-    let config = CliDb::open_default(cli_db).await?;
-    let server = config
-        .get_server(&args.server)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", args.server))?;
-    let token = auth::lookup_token(&server)?;
+fn print_field(label: &str, value: impl std::fmt::Display) {
+    println!("{label:<9}{value}");
+}
 
+async fn print_auth_status(server: &ServerEntry) -> Result<()> {
+    let token = auth::lookup_token(server)?;
     let base = server.url.trim_end_matches('/');
-    let health_client = auth::build_http_client(&server, None, Some(Duration::from_secs(5)))?;
-    let health = health_client.get(format!("{base}/v1/health")).send().await;
-    match health {
-        Ok(response) if response.status().is_success() => {
-            println!("server: reachable");
-        }
+    let health_client = auth::build_http_client(server, None, Some(Duration::from_secs(5)))?;
+    match health_client.get(format!("{base}/v1/health")).send().await {
+        Ok(response) if response.status().is_success() => print_field("Server:", "reachable"),
         Ok(response) => {
-            println!(
-                "server: unreachable (health returned {})",
-                response.status()
+            print_field(
+                "Server:",
+                format!("unreachable (health returned {})", response.status()),
             );
             return Ok(());
         }
         Err(error) => {
-            println!("server: unreachable ({error})");
+            print_field("Server:", format!("unreachable ({error})"));
             return Ok(());
         }
     }
 
     let Some(token) = token else {
-        println!("token: missing");
-        println!("read: missing token");
-        println!("admin: missing token");
+        print_field("Read:", "missing token");
+        print_field("Admin:", "missing token");
         return Ok(());
     };
 
-    let client = auth::build_http_client(&server, Some(&token), Some(Duration::from_secs(5)))?;
-    let read = client.get(format!("{base}/v1/probes")).send().await;
-    match read {
-        Ok(response) if response.status().is_success() => println!("read: ok"),
+    let client = auth::build_http_client(server, Some(&token), Some(Duration::from_secs(5)))?;
+    match client.get(format!("{base}/v1/probes")).send().await {
+        Ok(response) if response.status().is_success() => print_field("Read:", "ok"),
         Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-            println!("read: invalid token")
+            print_field("Read:", "invalid token")
         }
         Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
-            println!("read: token lacks read scope")
+            print_field("Read:", "token lacks read scope")
         }
-        Ok(response) => println!("read: unexpected status {}", response.status()),
-        Err(error) => println!("read: request failed ({error})"),
+        Ok(response) => print_field("Read:", format!("unexpected status {}", response.status())),
+        Err(error) => print_field("Read:", format!("request failed ({error})")),
     }
 
-    let admin = client.get(format!("{base}/v1/tokens")).send().await;
-    match admin {
-        Ok(response) if response.status().is_success() => println!("admin: ok"),
+    match client.get(format!("{base}/v1/tokens")).send().await {
+        Ok(response) if response.status().is_success() => print_field("Admin:", "ok"),
         Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
-            println!("admin: invalid token")
+            print_field("Admin:", "invalid token")
         }
         Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
-            println!("admin: token is not an admin token")
+            print_field("Admin:", "token is not an admin token")
         }
-        Ok(response) => println!("admin: unexpected status {}", response.status()),
-        Err(error) => println!("admin: request failed ({error})"),
+        Ok(response) => print_field("Admin:", format!("unexpected status {}", response.status())),
+        Err(error) => print_field("Admin:", format!("request failed ({error})")),
     }
 
     Ok(())
+}
+
+pub async fn edit_server(args: EditServerArgs, cli_db: Option<&Path>) -> Result<()> {
+    let config = CliDb::open_default(cli_db).await?;
+    let entry = config
+        .get_server(&args.name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", args.name))?;
+
+    if !has_edits(&args) {
+        return edit_server_interactive(&config, entry).await;
+    }
+
+    let url = args.url.as_deref();
+    if let Some(url) = url {
+        validate_url(url)?;
+    }
+    let ca_cert = if args.clear_ca_cert {
+        Some(None)
+    } else if let Some(path) = &args.ca_cert {
+        validate_ca_path(path)?;
+        Some(Some(path.display().to_string()))
+    } else {
+        None
+    };
+    let token = if args.clear_token {
+        Some(None)
+    } else {
+        args.token_source.read()?.map(Some)
+    };
+
+    config
+        .update_server(
+            &args.name,
+            url,
+            ca_cert.as_ref().map(|value| value.as_deref()),
+            token.as_ref().map(|value| value.as_deref()),
+        )
+        .await?;
+    println!("Updated server '{}'", args.name);
+    Ok(())
+}
+
+fn has_edits(args: &EditServerArgs) -> bool {
+    args.url.is_some()
+        || args.ca_cert.is_some()
+        || args.clear_ca_cert
+        || !args.token_source.is_empty()
+        || args.clear_token
+}
+
+async fn edit_server_interactive(config: &CliDb, entry: ServerEntry) -> Result<()> {
+    let document = EditableServer {
+        url: entry.url.clone(),
+        ca_cert: entry.ca_cert.clone(),
+        token: None,
+    };
+    let yaml = serde_yaml::to_string(&document).context("Failed to render server YAML")?;
+    let yaml = yaml.replace(
+        "token: null",
+        "# Set a value to replace the stored token, \"\" to clear it, or null to keep it.\ntoken: null",
+    );
+    let temp = TempFile::create(&yaml)?;
+    run_editor(temp.path())?;
+    let text = fs::read_to_string(temp.path())
+        .with_context(|| format!("Failed to read {}", temp.path().display()))?;
+    let parsed: EditableServer =
+        serde_yaml::from_str(&text).context("Invalid server YAML document")?;
+
+    validate_url(&parsed.url)?;
+    let ca_cert = match parsed.ca_cert.as_deref() {
+        None | Some("") => None,
+        Some(path) => {
+            validate_ca_path(Path::new(path))?;
+            Some(path.to_string())
+        }
+    };
+    let token = match parsed.token.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(token) => Some(Some(auth::validate_token_input(token.to_string())?)),
+    };
+
+    let url_changed = parsed.url != entry.url;
+    let ca_changed = ca_cert.as_deref() != entry.ca_cert.as_deref();
+    let token_changed = match &token {
+        None => false,
+        Some(None) => entry.token.is_some(),
+        Some(Some(token)) => entry.token.as_deref() != Some(token.as_str()),
+    };
+    if !url_changed && !ca_changed && !token_changed {
+        println!("No changes.");
+        return Ok(());
+    }
+
+    config
+        .update_server(
+            &entry.name,
+            Some(&parsed.url),
+            Some(ca_cert.as_deref()),
+            token.as_ref().map(|value| value.as_deref()),
+        )
+        .await?;
+    println!("Updated server '{}'", entry.name);
+    Ok(())
+}
+
+fn validate_ca_path(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("Failed to read CA certificate {}", path.display()))?;
+    Ok(())
+}
+
+fn run_editor(path: &Path) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("edit-server requires an interactive terminal");
+    }
+    let editor = env::var("EDITOR").unwrap_or_default();
+    if editor.trim().is_empty() {
+        anyhow::bail!(
+            "EDITOR is not set; set it to an editor command such as 'vi' or 'code --wait'"
+        );
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"$1\"", editor))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .with_context(|| format!("Failed to run editor '{editor}'"))?;
+    if !status.success() {
+        anyhow::bail!("Editor exited with status {status}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditableServer {
+    url: String,
+    #[serde(default)]
+    ca_cert: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn create(contents: &str) -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = env::temp_dir().join(format!(
+            ".boot-edit-server-{}-{nanos}.yaml",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        file.sync_all()?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 pub async fn remove_server(args: RemoveServerArgs, cli_db: Option<&Path>) -> Result<()> {
@@ -337,8 +577,8 @@ pub async fn remove_server(args: RemoveServerArgs, cli_db: Option<&Path>) -> Res
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", args.name))?;
     eprintln!(
         "Removing server '{}' ({}). The server-side token is not revoked; use \
-         boot admin --server {} revoke-token or the local API DB to revoke it.",
-        server.name, server.url, server.name
+         boot revoke-token {}/<token-id> or boot revoke-token {} --all.",
+        server.name, server.url, server.name, server.name
     );
     print_servers_removed(&config, &args.name).await?;
     config.remove_server(&args.name).await?;

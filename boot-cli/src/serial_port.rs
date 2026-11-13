@@ -8,7 +8,7 @@ use crate::auth::{api_client, map_error};
 use crate::cli_db::CliDb;
 
 #[derive(Args)]
-pub struct SerialShellArgs {
+pub struct AttachSerialArgs {
     /// Server name and serial port ID in format: {server-name}/{port-id}
     pub server_and_port: String,
     /// Attach to an existing session only
@@ -81,7 +81,7 @@ async fn upgraded_to_websocket(
     .await
 }
 
-pub async fn serial_shell(args: SerialShellArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
+pub async fn attach_serial(args: AttachSerialArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
     let parts: Vec<&str> = args.server_and_port.splitn(2, '/').collect();
     if parts.len() != 2 {
         anyhow::bail!("Invalid format. Expected {{server-name}}/{{port-id}}");

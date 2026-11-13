@@ -10,7 +10,7 @@ use crate::auth::{api_client, api_client_with_timeout, map_error};
 use crate::cli_db::CliDb;
 
 #[derive(Args)]
-pub struct ProbeRunArgs {
+pub struct RunFirmwareArgs {
     /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
     pub server_and_selector: String,
     /// Path to the ELF file
@@ -24,7 +24,7 @@ pub struct ProbeRunArgs {
 }
 
 #[derive(Args)]
-pub struct ProbeAttachArgs {
+pub struct AttachProbeArgs {
     /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
     pub server_and_selector: String,
     /// Optional path to the ELF file for defmt decoding
@@ -45,7 +45,7 @@ pub struct ProbeAttachArgs {
 }
 
 #[derive(Args)]
-pub struct StartProbeDapArgs {
+pub struct StartDapArgs {
     /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
     pub server_and_selector: String,
     /// Port to listen on for DAP connections (default: 50000)
@@ -165,7 +165,7 @@ async fn find_active_session(
         .find(|session| session.resource_id == resource_id && session.kind == kind))
 }
 
-pub async fn probe_run(args: ProbeRunArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
+pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
     let (server_name, selector) = split_server_resource(&args.server_and_selector)?;
     let config = CliDb::open_default(cli_db).await?;
     let server = config
@@ -266,8 +266,8 @@ pub async fn probe_run(args: ProbeRunArgs, cli_db: Option<&std::path::Path>) -> 
 
     if let Some(serial_shell) = args.serial_shell {
         println!();
-        crate::serial_port::serial_shell(
-            crate::serial_port::SerialShellArgs {
+        crate::serial_port::attach_serial(
+            crate::serial_port::AttachSerialArgs {
                 server_and_port: serial_shell,
                 follow: false,
                 new: true,
@@ -279,8 +279,8 @@ pub async fn probe_run(args: ProbeRunArgs, cli_db: Option<&std::path::Path>) -> 
         .await?;
     } else if !args.no_attach {
         println!();
-        probe_attach(
-            ProbeAttachArgs {
+        attach_probe(
+            AttachProbeArgs {
                 server_and_selector: args.server_and_selector,
                 elf: Some(args.elf_path),
                 follow: false,
@@ -296,7 +296,7 @@ pub async fn probe_run(args: ProbeRunArgs, cli_db: Option<&std::path::Path>) -> 
     Ok(())
 }
 
-pub async fn probe_attach(args: ProbeAttachArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
+pub async fn attach_probe(args: AttachProbeArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
     use defmt_decoder::Table as DefmtTable;
 
     let (server_name, selector) = split_server_resource(&args.server_and_selector)?;
@@ -472,10 +472,7 @@ pub async fn probe_attach(args: ProbeAttachArgs, cli_db: Option<&std::path::Path
     Ok(())
 }
 
-pub async fn start_probe_dap(
-    args: StartProbeDapArgs,
-    cli_db: Option<&std::path::Path>,
-) -> Result<()> {
+pub async fn start_dap(args: StartDapArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
     let _ = (args, cli_db);
     anyhow::bail!("DAP sessions are not implemented yet")
 }

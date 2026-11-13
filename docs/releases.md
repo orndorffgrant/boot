@@ -1,7 +1,7 @@
 # Releases and updates
 
 `boot` is released from Git tags and published as GitHub Releases. Installed
-copies can update themselves with `boot admin update`.
+copies can update themselves with `boot update`.
 
 ## Versioning
 
@@ -67,7 +67,7 @@ published as GitHub pre-releases.
 Run the update on each host that runs `boot`:
 
 ```bash
-sudo boot admin update
+sudo boot update
 ```
 
 The command queries GitHub Releases, verifies the download against the
@@ -79,8 +79,8 @@ and the old service is restarted.
 ### Options
 
 ```text
-boot admin update [--check] [--version TAG] [--force] [--yes]
-                  [--no-restart] [--repo OWNER/REPO]
+boot update [--check] [--version TAG] [--force] [--yes]
+            [--no-restart] [--repo OWNER/REPO]
 ```
 
 | Flag | Behavior |
@@ -99,19 +99,19 @@ The default repository is `orndorffgrant/boot`.
 Check whether an update is available:
 
 ```bash
-boot admin update --check
+boot update --check
 ```
 
 Install a specific release:
 
 ```bash
-sudo boot admin update --version v2026.1103.0
+sudo boot update --version v2026.1103.0
 ```
 
 Replace the binary without interrupting a running service:
 
 ```bash
-sudo boot admin update --no-restart
+sudo boot update --no-restart
 ```
 
 ### GitHub API rate limits
@@ -128,7 +128,7 @@ different host and do not carry it.
 
 ## Operational notes
 
-- `boot admin update` updates the local host only. Run it on every host.
+- `boot update` updates the local host only. Run it on every host.
 - Invoke the same binary path that systemd uses. If the unit runs a different
   path, the update warns that the service may not use the replaced file.
 - A service restart interrupts in-flight flash, debug, and serial operations.

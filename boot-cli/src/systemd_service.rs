@@ -119,6 +119,51 @@ pub fn is_service_active() -> Result<Option<bool>> {
     }
 }
 
+/// Return a human-readable state for the `boot-api` unit.
+///
+/// Returns `None` when systemd is unavailable.
+pub fn service_status() -> Result<Option<String>> {
+    let output = match Command::new("systemctl")
+        .args(["is-active", "boot-api"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Failed to execute systemctl is-active"),
+    };
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if state.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(match state.as_str() {
+        "active" => "Running".to_string(),
+        "inactive" => "Stopped".to_string(),
+        "failed" => "Failure".to_string(),
+        "activating" => "Starting".to_string(),
+        "deactivating" => "Stopping".to_string(),
+        other => other.to_string(),
+    }))
+}
+
+/// Return the host and port configured in the `boot-api` unit's `ExecStart`.
+///
+/// Returns `None` when systemd or the unit is unavailable.
+pub fn service_bind() -> Result<Option<String>> {
+    let output = match Command::new("systemctl")
+        .args(["show", "boot-api", "--property=ExecStart", "--value"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Failed to execute systemctl show"),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_exec_start_bind(&text))
+}
+
 /// Return the executable path configured in the `boot-api` unit, if it can be
 /// determined.
 pub fn service_executable() -> Result<Option<PathBuf>> {
@@ -137,6 +182,41 @@ pub fn service_executable() -> Result<Option<PathBuf>> {
 
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(parse_exec_start(&text))
+}
+
+fn parse_exec_start_bind(text: &str) -> Option<String> {
+    let argv = text.split("argv[]=").nth(1)?.split(" ;").next()?.trim();
+    if argv.is_empty() {
+        return None;
+    }
+    let mut host = None;
+    let mut port = None;
+    let mut args = argv.split_whitespace();
+    while let Some(arg) = args.next() {
+        if arg == "--host" {
+            host = args.next();
+        } else if let Some(value) = arg.strip_prefix("--host=") {
+            host = Some(value);
+        } else if arg == "--port" {
+            port = args.next();
+        } else if let Some(value) = arg.strip_prefix("--port=") {
+            port = Some(value);
+        } else if arg == "-p" {
+            port = args.next();
+        }
+    }
+    Some(format_host_port(
+        host.unwrap_or("127.0.0.1"),
+        port.unwrap_or("46673"),
+    ))
+}
+
+fn format_host_port(host: &str, port: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn parse_exec_start(text: &str) -> Option<PathBuf> {
@@ -167,5 +247,24 @@ mod tests {
         );
         assert_eq!(parse_exec_start(""), None);
         assert_eq!(parse_exec_start("{ path= ; }"), None);
+    }
+
+    #[test]
+    fn parses_exec_start_bind() {
+        let text = "{ path=/usr/local/bin/boot ; argv[]=/usr/local/bin/boot run-server \
+                    --host 0.0.0.0 --port 46674 ; ignore_errors=no ; }";
+        assert_eq!(
+            parse_exec_start_bind(text),
+            Some("0.0.0.0:46674".to_string())
+        );
+        let ipv6 = "{ path=/usr/local/bin/boot ; argv[]=/usr/local/bin/boot run-server \
+                     --host ::1 ; }";
+        assert_eq!(parse_exec_start_bind(ipv6), Some("[::1]:46673".to_string()));
+        let defaults = "{ path=/usr/local/bin/boot ; argv[]=/usr/local/bin/boot run-server ; }";
+        assert_eq!(
+            parse_exec_start_bind(defaults),
+            Some("127.0.0.1:46673".to_string())
+        );
+        assert_eq!(parse_exec_start_bind(""), None);
     }
 }

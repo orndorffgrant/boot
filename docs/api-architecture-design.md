@@ -126,8 +126,8 @@ extractor; nothing else is.
   applied in the runtime, not reimplemented per handler.
 - **Testable without hardware.** Hardware access sits behind traits that can be
   replaced with deterministic fakes.
-- **Preserve the CLI experience.** `probe-run`, `probe-attach`, `serial-shell`,
-  and `start-probe-dap` keep their workflow; progress and reconnect improve.
+- **Preserve the CLI experience.** `run-firmware`, `attach-probe`, `attach-serial`,
+  and `start-dap` keep their workflow; progress and reconnect improve.
 - **Session recovery and replay.** A serial/RTT session survives a restart when
   its resource is still present; closed sessions remain replayable.
 - **Incremental delivery.** Each migration phase is shippable on its own.
@@ -1259,7 +1259,7 @@ follow/new/read-only explicit flags:
 
 | Intent | Probe/RTT | Serial |
 | --- | --- | --- |
-| Attach to the active session, or create one if none | `boot probe-attach <server>/<probe>` | `boot serial-shell <server>/<port>` |
+| Attach to the active session, or create one if none | `boot attach-probe <server>/<probe>` | `boot attach-serial <server>/<port>` |
 | Join an existing session only | `--follow` | `--follow` |
 | Create a new session only | `--new` | `--new` |
 | Read-only subscriber | `--read-only` | `--read-only` |
@@ -1269,32 +1269,32 @@ follow/new/read-only explicit flags:
 Default behavior:
 
 - If exactly one active session exists for the resource, attach to it.
-- If none exists, create one. `probe-attach` creates an RTT session;
-  `serial-shell` creates a serial session.
+- If none exists, create one. `attach-probe` creates an RTT session;
+  `attach-serial` creates a serial session.
 - `--follow` requires an existing session and never creates one.
 - `--new` requires no active session and never joins one; a busy resource is a
   clear `409` with the existing session ID.
-- `serial-shell` attaches in write mode by default. `serial-shell --follow`
+- `attach-serial` attaches in write mode by default. `attach-serial --follow`
   attaches read-only to avoid accidental input; `--write` overrides that.
 - `--read-only` always requests read mode.
-- `probe-attach` is always read-only at the data level; RTT has no input stream.
+- `attach-probe` is always read-only at the data level; RTT has no input stream.
 - `--session <id>` attaches directly and is useful in scripts.
 
 `boot probe-follow` and `boot serial-follow` are therefore removed. They were
 duplicating discovery, mode selection, and reconnect logic for no separate
-capability. `boot session-replay` remains separate because it targets retained
+capability. `boot replay-session` remains separate because it targets retained
 past data rather than a live hardware session.
 
-`boot probe-run` keeps its post-flash attach behavior and uses the same
-create-or-join logic. `boot start-probe-dap` remains separate because it runs a
+`boot run-firmware` keeps its post-flash attach behavior and uses the same
+create-or-join logic. `boot start-dap` remains separate because it runs a
 local TCP-to-DAP bridge, not an interactive stream.
 
 Other session commands stay separate:
 
 - `boot list-sessions [--all|--active|--past]`
-- `boot session-replay <server>/<session-id> [--from <seq>] [--elf <path>] [--include-input]`
-- `boot session-export <server>/<session-id> --format asciicast-v3 --out <file>`
-- `boot start-probe-dap`
+- `boot replay-session <server>/<session-id> [--from <seq>] [--elf <path>] [--include-input]`
+- `boot export-session <server>/<session-id> --format asciicast-v3 --out <file>`
+- `boot start-dap`
 
 ## 11. Change follow and session data WebSockets
 
@@ -1799,7 +1799,7 @@ for token administration and runs the same migrations.
 Runtime state reuses the existing API database rather than introducing a second
 SQLite file:
 
-- `boot-api` and `boot admin` already open and migrate `boot.sqlite3`.
+- `boot-api` and the CLI token commands both open the same `boot.sqlite3`.
 - Token tables and runtime tables share the same permission checks and backup
   story.
 - Session payloads stay in segment files, so the database only receives small
@@ -1936,7 +1936,7 @@ Rules:
   replay.
 - Serial input is written as `input` records with the same monotonic record
   sequence. Live subscribers receive only `output` records; replay defaults to
-  output too. Asciicast export can include input events, and `session-replay`
+  output too. Asciicast export can include input events, and `replay-session`
   can display them with an explicit flag. Input records may contain secrets.
 - `seq` is a record sequence, not a byte offset. Subscriber-visible output
   sequences can skip input records; that is not a gap. An explicit `gap` record
@@ -2004,7 +2004,7 @@ the old one remains replay-only until manually resumed after the new one closes.
   and then continues from the ring.
 - `?replay=strict` closes with `4409` if the requested cursor is outside
   retention instead of skipping with a gap.
-- CLI: `boot session-replay <server>/<session-id> [--from <seq>] [--elf <path>] [--include-input]`.
+- CLI: `boot replay-session <server>/<session-id> [--from <seq>] [--elf <path>] [--include-input]`.
 - `DELETE /v1/sessions/{id}` closes a live session but retains data.
 - `DELETE /v1/sessions/{id}/data` purges the segment files and marks the session
   `replayable = false`; metadata remains for audit. It is rejected with `409`
@@ -2167,7 +2167,7 @@ Authorization: Bearer boot_v1_...
 CLI:
 
 ```text
-boot session-export <server>/<session-id> --format asciicast-v3 --out session.cast
+boot export-session <server>/<session-id> --format asciicast-v3 --out session.cast
 ```
 
 Alternatives considered:
@@ -2405,7 +2405,7 @@ measurement.
 | Q9 | Polling vs `udev` for inventory? | Decided: poll every 1 second first; add `udev` behind the same interface later. |
 | Q10 | Should session create wait for a lease or queue? | Decided: wait up to `wait_ms` (default 5 seconds), then `409`. Changes queue in `waiting`. |
 | Q11 | Should we expose a Prometheus `/metrics` endpoint now? | Decided: no; expose counters in `/v1/server`, add an exporter later. |
-| Q12 | Should `probe-run --attach` hand off the lease atomically from flash to RTT? | Decided: no. Flash completes and releases; the CLI then creates an RTT session. |
+| Q12 | Should `run-firmware --attach` hand off the lease atomically from flash to RTT? | Decided: no. Flash completes and releases; the CLI then creates an RTT session. |
 | Q13 | Should idle resource workers stay open? | Decided: yes, for `idle_resource_ttl` (60 seconds), then close. |
 | Q14 | How many subscribers should a session allow? | Decided: default 8, hard cap 32; configurable. |
 | Q15 | Should `read` tokens be able to follow session data? | Decided: no. `read` lists metadata; session bytes require `control`. A future `monitor` scope can change this. |

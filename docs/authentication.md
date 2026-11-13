@@ -30,11 +30,10 @@ This design adds **opaque bearer tokens**:
   revoke tokens through `/v1/tokens`.
 - `boot-cli` auto-provisions an admin token and stores client tokens in a SQLite
   CLI database.
-- Token administration lives under `boot admin`: `boot admin create-token`,
-  `boot admin list-tokens`, `boot admin revoke-token`. Client-credential commands
-  (`add-server`, `set-token`, `check-auth`) stay top-level.
-- Admin commands write the local API DB by default and can use the HTTP admin API
-  with `--server <name>`.
+- Token administration uses the top-level commands `boot create-token`,
+  `boot list-tokens`, and `boot revoke-token`. They use the HTTP admin API by
+  default and accept `--direct` for the local API DB. Client-credential commands
+  (`add-server`, `edit-server`, `show-server`) remain separate.
 - Non-loopback binds require TLS or an explicit `--allow-insecure-http`
   acknowledgement. SSH port-forwarding and WireGuard/Tailscale remain the
   recommended remote patterns.
@@ -122,7 +121,7 @@ existing deployments.
 | Enforcement | Dropshot 0.17.1 `SharedExtractor` (`Auth<Read>`, `Auth<Control>`, `Auth<Admin>`) |
 | Scopes | `read`, `control`, `admin`; `admin` implies both others |
 | Token API | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{selector}`, `DELETE /v1/tokens?all=true` |
-| CLI naming | `boot admin create-token`, `boot admin list-tokens`, `boot admin revoke-token`; verb-noun leaves |
+| CLI naming | `boot create-token`, `boot list-tokens`, `boot revoke-token`; flat verb-noun commands |
 | Provisioning | First run auto-creates an admin `local` token; `--no-provision` skips only local auto-provisioning |
 | API DB access | Read-write for both the server and CLI; migrations always run |
 | Revocation | SQLite delete + per-request token lookup; WebSockets revalidate with a DB read |
@@ -168,7 +167,7 @@ server never needs plaintext client credentials:
 
 | Database | Owner | Contents | Default path |
 | --- | --- | --- | --- |
-| API DB | `boot-api` / `boot admin` | Token hashes, names, scopes, expiry | `$XDG_DATA_HOME/boot/boot.sqlite3` |
+| API DB | `boot-api` / CLI token commands | Token hashes, names, scopes, expiry | `$XDG_DATA_HOME/boot/boot.sqlite3` |
 | CLI DB | `boot-cli` | Server entries, plaintext client tokens, CA paths | `$XDG_DATA_HOME/boot/boot-cli.sqlite3` |
 
 On Linux the defaults are `~/.local/share/boot/boot.sqlite3` and
@@ -202,8 +201,8 @@ Why two databases:
 - A future single-database mode is possible but would mix those trust levels.
 
 The API DB is written by both the CLI and the server. The CLI writes it directly
-when `boot admin` targets the local database (the default); the server writes it
-through the `/v1/tokens` admin endpoints. Keep both paths in the same module:
+when a token command uses `--direct`; the server writes it through the
+`/v1/tokens` admin endpoints. Keep both paths in the same module:
 writers serialize with `BEGIN IMMEDIATE`. `--no-provision` only skips creating the
 local token/server entry/credential; migrations and the admin endpoints are
 unaffected.
@@ -242,7 +241,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   server are ignored with a warning so a newer CLI can add scopes without breaking
   an older server.
 - `created_at`/`expires_at`: Unix seconds. No expiry by default; opt in with
-  `boot admin create-token --expires-in`.
+  `boot create-token --expires-in`.
 
 Schema notes:
 
@@ -279,7 +278,7 @@ CREATE TABLE IF NOT EXISTS servers (
 ```
 
 - The server and its optional credential live on the same row, so `add-server`,
-  `set-token`, and `remove-server` are single-row operations.
+  `edit-server`, and `remove-server` are single-row operations.
 - `url` is stored once. There is no separate URL/token file that can disagree.
 - `ca_cert` is an optional PEM root for self-signed servers. It is a path, not a
   secret.
@@ -310,8 +309,8 @@ PRAGMA synchronous = FULL;
   The transient rollback journal is protected by the directory mode.
 - `busy_timeout` handles the brief overlap when the CLI writes a token while the
   server reads, or (later) when both the CLI and the server write the API DB.
-- Use `BEGIN IMMEDIATE` for multi-statement writes (`boot admin create-token`/
-  `boot admin revoke-token`, `/v1/tokens` handlers, server add/remove, and schema
+- Use `BEGIN IMMEDIATE` for multi-statement writes (`boot create-token`/
+  `boot revoke-token`, `/v1/tokens` handlers, server add/remove, and schema
   changes). Keep transactions short; do not do network I/O inside a transaction.
 - If write volume grows (routine `last_used_at` updates or a busy remote admin
   setup), revisit `journal_mode = WAL` for the API DB and measure the write rate.
@@ -490,7 +489,7 @@ Notes:
 | `admin` | Token administration via `/v1/tokens`; implies `control` |
 
 `control` implies `read`; `admin` implies `control`. The CLI expands scopes when
-creating a token so `boot admin list-tokens` shows the effective set.
+creating a token so `boot list-tokens` shows the effective set.
 
 `get_target` is `control`, not `read`: the current implementation opens the probe
 and attaches a session (`probe.attach`), which can halt or disturb the target.
@@ -514,7 +513,7 @@ Endpoint policy:
 | `GET /v1/probes/{selector}/dap` | `control` |
 | `GET /v1/serial-ports/{port_id}/shell` | `control` |
 
-Health is public so monitoring and `boot check-auth` can test reachability without
+Health is public so monitoring and `boot show-server` can test reachability without
 a token. It exposes only status, version, and the fact that auth is required. It does
 not expose probe, serial, or token information.
 
@@ -607,25 +606,25 @@ parsing and before any database write.
    scopes `read,control,admin`, write its hash to the API DB, and store the
    plaintext token in the CLI DB credential for `local`. Both writes are separate
    transactions; if the second fails, the token remains valid and the CLI prints
-   `boot set-token local --token-stdin` instead of losing the secret.
+   `boot edit-server local --token-stdin` instead of losing the secret.
 6. If the API DB has tokens but none has the `admin` scope, do not silently mint a
    second admin token and do not replace anything. Log a warning and print:
-   `boot admin create-token --name local-admin --scope admin` then
-   `boot set-token local --token-stdin`. Existing tokens stay valid.
+   `boot create-token --direct --name local-admin --scope admin` then
+   `boot edit-server local --token-stdin`. Existing tokens stay valid.
 7. If the API DB has an admin token but the local credential is missing, do not
    silently revoke anything. Print:
-   `boot admin create-token --name local-admin --scope admin --save-to local`, or
-   `boot set-token local --token-stdin` if the secret is available elsewhere.
+   `boot create-token --direct --name local-admin --scope admin --save-to local`,
+   or `boot edit-server local --token-stdin` if the secret is available elsewhere.
 8. Start the server.
 
 The bootstrap secret is never printed to stdout or the journal; it goes directly
-from the CLI process to the `0600` CLI database. `boot admin create-token` is the
-command that prints a token, once, for copying to another machine.
+from the CLI process to the `0600` CLI database. `boot create-token --direct` is
+the command that prints a token, once, for copying to another machine.
 
 `--no-provision` affects only the local token, `local` server entry, and CLI
 credential. Migrations still run, the API DB stays writable, and `/v1/tokens`
 remains available. The database may be empty, in which case protected endpoints
-return `401` until a token is created with `boot admin`.
+return `401` until a token is created with `boot create-token --direct`.
 
 `boot stop-server` must **not** delete the `local` server row or its credential. The
 current implementation removes the local entry when stopping; with authentication
@@ -634,27 +633,36 @@ Configuration is not service state.
 
 #### Create, list, revoke
 
-These commands write the local API DB by default, so they work with the server
-stopped, over SSH, and as the lockout recovery path. Add `--server <name>` to call
-the `/v1/tokens` admin endpoints with that server's stored credential instead.
+These commands use the server's HTTP admin API by default, so the named server's
+stored credential must have the `admin` scope. Add `--direct` to use the local API
+DB instead. Direct mode works with the server stopped, over SSH, and as the
+lockout recovery path.
 
 ```console
-$ boot admin create-token --name laptop
+$ boot create-token local --name laptop
 boot_v1_...                      # printed once; store it on the laptop
-$ boot admin list-tokens
-ID                NAME     SCOPES                 CREATED              EXPIRES
-9f2c1a7b4e8d0c31  laptop   read, control          2026-10-28 12:34     never
-b3a91c44d2f10e77  local    read, control, admin   2026-10-28 12:30     never
-$ boot admin revoke-token laptop
-$ boot admin revoke-token --all        # requires explicit confirmation
+$ boot list-tokens
+SERVER  ID                NAME     SCOPES                 CREATED              EXPIRES
+local   9f2c1a7b4e8d0c31  laptop   read, control          2026-10-28 12:34     never
+local   b3a91c44d2f10e77  local    read, control, admin   2026-10-28 12:30     never
+$ boot revoke-token local/laptop
+$ boot revoke-token local --all        # requires explicit confirmation
 ```
 
 Against a remote server with an admin credential:
 
 ```console
-$ boot admin --server pi create-token --name ci --read-only --save-to ci
-$ boot admin --server pi list-tokens
-$ boot admin --server pi revoke-token ci
+$ boot create-token pi --name ci --read-only --save-to ci
+$ boot list-tokens --server pi
+$ boot revoke-token pi/ci
+```
+
+Direct recovery mode:
+
+```console
+$ boot create-token --direct --name laptop
+$ boot list-tokens --direct
+$ boot revoke-token --direct laptop
 ```
 
 - `--read-only` creates `["read"]`; `--scope control` creates `["read","control"]`;
@@ -668,7 +676,7 @@ $ boot admin --server pi revoke-token ci
   in the response.
 - `--save-to <server>` stores the plaintext token in the CLI DB for a server entry
   after the API DB commit or HTTP response. If it fails, the token is still valid
-  and has already been printed; use `boot set-token` to retry without reissuing.
+  and has already been printed; use `boot edit-server` to retry without reissuing.
 - Names are unique; revoke-by-name fails if ambiguous. `list-tokens` never prints
   the token or hash; in remote mode it marks the requesting token with `current`.
 - `create-token` writes in one `BEGIN IMMEDIATE` transaction and prints the secret
@@ -676,13 +684,13 @@ $ boot admin --server pi revoke-token ci
 - Token creation and revocation are visible to the next request immediately,
   whether the write came from the CLI or the HTTP admin API.
 - If the API DB is locked or unwritable, the command fails with a clear error.
-- `--server` uses the stored token for that entry and requires the `admin` scope.
+- API mode uses the named server's stored token and requires the `admin` scope.
   A `403` means the stored credential is not an admin token; store one with
-  `boot set-token`.
+  `boot edit-server <server> --token-stdin`.
 
 There is still no unauthenticated bootstrap endpoint. The first admin token comes
-from filesystem provisioning (`boot start-server` or `boot admin` with direct
-`--api-db` access), which is the same trust boundary as the `0600` database file.
+from filesystem provisioning (`boot start-server` or `boot create-token --direct`
+access), which is the same trust boundary as the `0600` database file.
 
 #### Revocation
 
@@ -782,13 +790,13 @@ distinction server-side.
 
 CLI mapping:
 
-- `401`: `Server 'pi' rejected the token. Run: boot set-token pi --token-stdin`
+- `401`: `Server 'pi' rejected the token. Run: boot edit-server pi --token-stdin`
 - `403` scope: `Token for 'pi' lacks the 'control' scope. Create a new token on the
   server and update this client.`
-- `403` for `boot admin --server`: `The stored token for 'pi' is not an admin token.
-  Store one with boot set-token pi --token-stdin, or use boot admin --api-db on the
+- `403` for a token command in API mode: `The stored token for 'pi' is not an admin
+  token. Store one with boot edit-server pi --token-stdin, or use --direct on the
   server host.`
-- `404`: `No token matches '<selector>'. Run: boot admin list-tokens`
+- `404`: `No token matches '<selector>'. Run: boot list-tokens --server pi`
 - `409`: `A token named '<name>' already exists. Use --replace to rotate it.`
 
 ### Audit and observability
@@ -819,7 +827,7 @@ signatures must stay the same. Apply auth through the shared reqwest client:
 fn api_client(server: &ServerEntry) -> Result<boot_api_client::Client> {
     let token = server.token.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "Server '{}' has no token. Run: boot set-token {} --token-stdin",
+            "Server '{}' has no token. Run: boot edit-server {} --token-stdin",
             server.name,
             server.name
         )
@@ -875,7 +883,7 @@ Implementation checks:
   consume. Regenerate `boot-api-client` and run
   `cargo build -p boot-api-client`.
 - Confirm the generated client exposes the four token operations and that
-  `boot admin --server` can call them with the existing `api_client()` helper.
+  `boot create-token <server>` can call them with the existing `api_client()` helper.
 - Verify progenitor does not generate an extra `authorization` function parameter
   from the security scheme. If it does, keep the spec accurate and adapt the client
   wrapper, or add the scheme in a doc-only post-processing step. The CLI helper is
@@ -885,52 +893,59 @@ Implementation checks:
 
 ### Command naming
 
-All server-side token operations live under the `boot admin` group. The group keeps
-the verb-noun leaf form used elsewhere:
+`boot` uses flat verb-noun commands. Server-side token operations are top-level
+commands, not a group:
 
 ```text
-boot admin create-token
-boot admin list-tokens
-boot admin revoke-token
+boot create-token
+boot list-tokens
+boot revoke-token
 boot add-server
-boot set-token
-boot check-auth
+boot edit-server
+boot show-server
+boot list-servers
+boot remove-server
 boot start-server
 boot run-server
 ```
 
-There are no top-level `create-token`, `list-tokens`, or `revoke-token` commands
-and no deprecated aliases. Client-credential commands (`add-server`, `set-token`,
-`check-auth`, `list-servers`, `remove-server`) stay top-level because they change
-local CLI state, not the server's token table.
+Token commands use the HTTP admin API by default. `create-token` and
+`revoke-token` take a server positional; `list-tokens` defaults to all configured
+servers and accepts `--server <name>`. `--direct` switches to the local API DB.
+Client-credential commands (`add-server`, `edit-server`, `show-server`,
+`list-servers`, `remove-server`) remain separate because they change local CLI
+state, not the server's token table.
 
-Do not add noun-verb forms such as `boot admin token create` or
-`boot auth set-token`.
-
-The existing `probe-run`, `probe-attach`, `serial-shell`, and `api-desc` commands
-predate this convention. They are out of scope for the auth change; if strict
-consistency is desired, add verb-noun aliases (`run-probe`, `attach-probe`,
-`open-serial`, `describe-api`) in a separate change with a deprecation window.
+Do not add noun-verb forms such as `boot token create` or `boot auth set-token`.
+There are no aliases or compatibility shims.
 
 ### Server-side token management
 
 ```text
-boot admin [--server <name>] create-token --name <name>
-                [--read-only | --scope <scope>]...
-                [--expires-in <duration>] [--replace] [--save-to <server>]
-boot admin [--server <name>] list-tokens
-boot admin [--server <name>] revoke-token <id-or-name> [--yes]
-boot admin [--server <name>] revoke-token --all [--yes]
+boot create-token <server> --name <name>
+                  [--read-only | --scope <scope>]...
+                  [--expires-in <duration>] [--replace] [--save-to <server>]
+boot list-tokens [--server <name>]
+boot revoke-token <server>/<id-or-name> [--yes]
+boot revoke-token <server> --all [--yes]
+
+boot create-token --direct --name <name> ...
+boot list-tokens --direct
+boot revoke-token --direct <id-or-name> [--yes]
+boot revoke-token --direct --all [--yes]
 ```
 
 Target selection:
 
-- Default: write the local API DB directly (honors the global `--api-db` path).
-  This works with the server stopped, over SSH, and as the recovery path if every
-  admin token is lost.
-- `--server <name>`: call `/v1/tokens` with the credential stored for that server
-  entry. The credential must have the `admin` scope.
-- An explicit `--api-db` together with `--server` is an error.
+- Default: call `/v1/tokens` with the credential stored for the named server. The
+  credential must have the `admin` scope.
+- `list-tokens` lists every configured server by default and prints a server column.
+  Use `--server <name>` to narrow it to one server.
+- `--direct`: open the local API database directly. This works with the server
+  stopped, over SSH, and as the recovery path if every admin token is lost.
+- `--direct` takes no server positional. A server positional or `--server` together
+  with `--direct` is an error.
+- `--api-db` is only meaningful with `--direct`.
 - Remote mode uses the same TLS/CA settings as other commands and never sends the
   token in a URL.
 
@@ -942,7 +957,7 @@ Behavior:
   the current HTTP request is allowed; the response contains the new secret.
 - `--save-to <server>` stores the new token in the CLI DB after success. This works
   for both direct and remote mode. If the CLI DB write fails, the token remains
-  valid and has been printed; use `boot set-token` to store it.
+  valid and has been printed; use `boot edit-server` to store it.
 - `revoke-token` asks for confirmation when the selector is the token used for the
   request, and `--all` always asks for confirmation. `--yes` is required in
   non-interactive use; it does not skip the warning text.
@@ -956,8 +971,11 @@ Behavior:
 ```text
 boot add-server <name> <url> [--token-stdin | --token-file <path> | --token <token>]
                              [--ca-cert <pem>]
-boot set-token <server> [--token-stdin | --token-file <path>]
-boot check-auth <server>
+boot edit-server <server>
+                 [--url <url>]
+                 [--ca-cert <path> | --clear-ca-cert]
+                 [--token-stdin | --token-file <path> | --token <token> | --clear-token]
+boot show-server [server]
 boot list-servers
 boot remove-server <name>
 ```
@@ -971,15 +989,16 @@ boot remove-server <name>
 - `add-server` inserts the server and any supplied credential in one transaction.
   A missing token adds the server with a warning; `list-servers` shows `token:
   missing` and protected commands fail with the actionable `401` message.
-- `set-token` requires an existing server and updates its credential in place. It
-  is also how an admin token is stored for `boot admin --server`.
-- `check-auth` calls the public health endpoint, a read endpoint, and
-  `GET /v1/tokens`; it reports "ok", "unreachable", "missing token", "invalid
-  token", "token lacks read scope", and whether the token has `admin` scope.
+- `edit-server` requires an existing server and updates its URL, CA certificate, or
+  credential in place. With no flags it opens a YAML document in `$EDITOR` and
+  stores the validated result. The stored token is never written to the temporary
+  file; `token: null` keeps it, `token: ""` clears it, and a value replaces it.
+- `show-server` defaults to `local` and reports the server's configuration, auth
+  state, and local systemd status and bind address when the name is `local`.
 - `list-servers` shows `token: stored/missing` and the TLS mode, never the token.
 - `remove-server` removes the server and its credential. It does **not** revoke the
-  server-side token; run `boot admin revoke-token` against the server (locally or
-  with `--server`).
+  server-side token; run `boot revoke-token <server>/<token-id>` or
+  `boot revoke-token <server> --all`.
 - `boot start-server` stores the auto-created admin credential for `local` and
   passes `--api-db` and `--cli-db` to the systemd unit.
 - `boot stop-server` stops the unit but leaves the local server row and credential
@@ -1029,11 +1048,12 @@ the same databases even if its working directory or `HOME` differs.
 | `boot-cli/Cargo.toml` | Add `sqlx` for the CLI DB. |
 | `boot-cli/migrations/0001_cli.sql` (new) | CLI DB server/credential migration; the optional token lives on the server row. |
 | `boot-cli/src/cli_db.rs` (new) | SQLx CLI DB pool, migrations, server/credential CRUD. |
-| `boot-cli/src/admin.rs` (new) | `boot admin` subcommand tree; direct API DB and `--server` HTTP modes; create/list/revoke; confirmation and `current` warnings. |
-| `boot-cli/src/auth.rs` (new) | Client credential lookup and `set-token`. |
+| `boot-cli/src/admin.rs` | Top-level token commands; HTTP admin API by default; local API DB with `--direct`; create/list/revoke; confirmation and `current` warnings. |
+| `boot-cli/src/auth.rs` | Client credential lookup and token-source helpers used by `add-server`/`edit-server`. |
 | `boot-cli/src/server_config.rs` | Removed; server/credential state is used directly through `cli_db.rs`. |
-| `boot-cli/src/main.rs` | Add the `Admin` subcommand and global `--cli-db`/`--api-db` handling; remove top-level token commands. |
-| `boot-cli/src/server.rs` | `add-server`, `check-auth`, server listing/removal; prepare both DBs before starting the unit; auto-provision an admin `local` token; upsert `local`; token/TLS flags; non-loopback guard; pass `--api-db`/`--cli-db` to systemd; stop deleting local config in `stop-server`. |
+| `boot-cli/src/main.rs` | Top-level token commands, server show/edit, grouped help commands, and global `--cli-db`/`--api-db` handling. |
+| `boot-cli/src/help.rs` | Custom grouped overview and focused `help-<object>` rendering. |
+| `boot-cli/src/server.rs` | `add-server`, `show-server`, `edit-server`, server listing/removal; prepare both DBs before starting the unit; auto-provision an admin `local` token; upsert `local`; token/TLS flags; non-loopback guard; pass `--api-db`/`--cli-db` to systemd; stop deleting local config in `stop-server`. |
 | `boot-cli/src/systemd_service.rs` | Forward `--api-db`, `--cli-db`, TLS, and advertise flags; never print secrets. |
 | `boot-cli/src/probe.rs`, `serial_port.rs` | Replace `Client::new` with `api_client()`; map 401/403; use the same client for upgrades. |
 | `boot-api-client/build.rs` | No code change; regenerate from the updated spec (including `/v1/tokens`) and validate against Dropshot 0.17.1. |
@@ -1099,21 +1119,24 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
 
 - `boot start-server` on an empty API DB creates an admin `local` token and stores
   its plaintext in the CLI DB only.
-- `boot admin create-token` writes `0600`, prints one secret, and
-  `boot admin list-tokens` does not.
-- `boot admin revoke-token` removes the row and the next request rejects it.
-- `boot admin --server pi ...` calls `/v1/tokens`, uses the stored credential, and
+- `boot create-token local` writes `0600`, prints one secret, and
+  `boot list-tokens` does not.
+- `boot revoke-token local/<selector>` removes the row and the next request rejects
+  it.
+- `boot create-token pi ...` calls `/v1/tokens`, uses the stored credential, and
   fails with the admin-scope message for a non-admin token.
-- `boot admin --server pi` with `--api-db` is rejected as conflicting.
-- `boot admin revoke-token --all` requires confirmation; `--yes` is needed
+- `boot create-token pi --api-db ...` is rejected; `--api-db` requires `--direct`.
+- `boot revoke-token local --all` requires confirmation; `--yes` is needed
   non-interactively.
-- `boot admin revoke-token <current-token>` warns before deleting.
-- `boot admin create-token --save-to local` stores the new token in the CLI DB; a
+- `boot revoke-token <server>/<current-token>` warns before deleting.
+- `boot create-token local --save-to local` stores the new token in the CLI DB; a
   failed CLI DB write still leaves a valid printed token.
-- `boot set-token` writes `0600`; `boot check-auth` reports the admin-scope state.
+- `boot create-token --direct` and `boot list-tokens --direct` use the local API DB.
+- `boot edit-server` writes `0600`; `boot show-server` reports the admin-scope state.
 - `boot add-server` stores server and credential atomically; a missing token warns
   and `list-servers` shows it.
-- Top-level `create-token`, `list-tokens`, and `revoke-token` are not accepted.
+- Old names such as `boot admin list-tokens`, `boot set-token`, and
+  `boot check-auth` are not accepted.
 - The CLI never reads `servers.json`; only `boot-cli.sqlite3` is used.
 - `boot stop-server` does not delete the `local` row or credential.
 - The `api_client` helper attaches `Authorization` and disables redirects (test the
@@ -1126,16 +1149,16 @@ $ boot start-server
 $ boot list-probes
 $ curl -i http://127.0.0.1:46673/v1/probes                 # 401
 $ curl -i -H "Authorization: Bearer $TOKEN" http://127.0.0.1:46673/v1/probes
-$ boot admin list-tokens
-$ boot admin create-token --name smoke
-$ boot admin --server local list-tokens                    # HTTP admin path
+$ boot list-tokens
+$ boot create-token local --name smoke
+$ boot list-tokens --server local                    # HTTP admin path
 $ curl -i -X POST -H "Authorization: Bearer $TOKEN" \
     -H 'content-type: application/json' \
     -d '{"name":"curl-test","scopes":["read"]}' \
     http://127.0.0.1:46673/v1/tokens                       # 201, secret once
-$ boot admin revoke-token local
+$ boot revoke-token local/smoke
 $ boot list-probes                                        # 401 + actionable message
-$ boot admin revoke-token smoke --api-db ~/.local/share/boot/boot.sqlite3  # recovery
+$ boot revoke-token --direct smoke --api-db ~/.local/share/boot/boot.sqlite3  # recovery
 ```
 
 ## Operational runbook
@@ -1145,7 +1168,7 @@ $ boot admin revoke-token smoke --api-db ~/.local/share/boot/boot.sqlite3  # rec
 ```console
 $ boot start-server      # creates boot.sqlite3 + boot-cli.sqlite3 if needed
 $ boot list-probes       # uses the stored admin local token
-$ boot admin list-tokens # shows local with read,control,admin
+$ boot list-tokens      # shows local with read,control,admin
 ```
 
 ### Add a remote client
@@ -1153,14 +1176,14 @@ $ boot admin list-tokens # shows local with read,control,admin
 On the server host:
 
 ```console
-$ boot admin create-token --name laptop
+$ boot create-token local --name laptop
 boot_v1_...
 ```
 
 Or from a machine that already holds an admin credential:
 
 ```console
-$ boot admin --server pi create-token --name laptop
+$ boot create-token pi --name laptop
 boot_v1_...
 ```
 
@@ -1168,7 +1191,7 @@ On the laptop:
 
 ```console
 $ boot add-server pi https://pi.local:46673 --token-stdin
-$ boot check-auth pi
+$ boot show-server pi
 ```
 
 For a server reached through SSH instead of TLS:
@@ -1180,11 +1203,11 @@ $ boot add-server pi http://127.0.0.1:46673 --token-stdin
 
 ### Rotate a token
 
-1. `boot admin create-token --name laptop-2` on the server (or
-   `boot admin --server pi create-token --name laptop-2`).
-2. `boot set-token laptop --token-stdin` on the client, pasting the new token.
-3. `boot admin revoke-token laptop` on the server (or
-   `boot admin --server pi revoke-token laptop`).
+1. `boot create-token local --name laptop-2` on the server (or
+   `boot create-token pi --name laptop-2`).
+2. `boot edit-server laptop --token-stdin` on the client, pasting the new token.
+3. `boot revoke-token local/laptop` on the server (or
+   `boot revoke-token pi/laptop`).
 
 Existing WebSockets on the old token close within the revalidation interval.
 The new token works on the next request.
@@ -1192,22 +1215,22 @@ The new token works on the next request.
 ### Lost or stolen token
 
 ```console
-$ boot admin revoke-token <id-or-name>
+$ boot revoke-token local/<id-or-name>
 ```
 
 If the token is unknown, revoke all and reissue:
 
 ```console
-$ boot admin revoke-token --all
-$ boot admin create-token --name <client>
+$ boot revoke-token local --all
+$ boot create-token local --name <client>
 ```
 
 If the stolen token is the only admin credential, use filesystem recovery on the
 server host:
 
 ```console
-$ boot admin revoke-token --all --api-db ~/.local/share/boot/boot.sqlite3
-$ boot admin create-token --name local --scope admin --save-to local
+$ boot revoke-token --direct --all --api-db ~/.local/share/boot/boot.sqlite3
+$ boot create-token --direct --name local --scope admin --save-to local
 ```
 
 Review server logs for the token id, request id, remote address, and control
@@ -1240,7 +1263,7 @@ The second form prints a warning and shows plaintext mode in `boot list-servers`
 - Exclude the CLI DB from backups and cloud sync: it contains plaintext client
   tokens.
 - The API DB contains hashes, not secrets, but protect it anyway.
-- On suspected compromise: `boot admin revoke-token --all`, reissue tokens, inspect
+- On suspected compromise: `boot revoke-token --all`, reissue tokens, inspect
   logs, and rotate any firmware or serial secrets that may have been exposed through
   the API.
 - Admin endpoints make remote revocation possible, but the local `--api-db` path
@@ -1268,8 +1291,9 @@ The second form prints a warning and shows plaintext mode in `boot list-servers`
 
 ## Future work
 
-- **Admin token UX:** `boot admin` list/create/revoke exists in this design; future
-  work can add `boot admin rotate-token`, token descriptions, and per-token last-use
+- **Token UX:** `boot create-token`, `boot list-tokens`, and `boot revoke-token`
+  exist in this design; future work can add `boot rotate-token`, token descriptions,
+  and per-token last-use
   display.
 - **Admin-specific rate limits and audit retention:** separate limits for `/v1/tokens`
   and a durable audit log for token creation/revocation.

@@ -1,11 +1,11 @@
-//! `boot admin` token administration, using the local API DB by default or the
-//! HTTP admin API when `--server` is supplied.
+//! Token administration. Commands use the HTTP admin API by default and can
+//! open the local API database directly with `--direct`.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::Args;
 
 use boot_api::auth::{CreateTokenRequest, Scopes, TokenRecord, TokenStore};
 use boot_api::store::{Store, resolve_api_db_path};
@@ -14,32 +14,13 @@ use crate::auth::{api_client, map_error};
 use crate::cli_db::{CliDb, ServerEntry};
 
 #[derive(Args)]
-pub struct AdminArgs {
-    /// Manage tokens through this server's HTTP admin API instead of the local API DB
-    #[arg(long)]
-    pub server: Option<String>,
-    #[command(subcommand)]
-    pub command: AdminCommand,
-}
-
-#[derive(Subcommand)]
-pub enum AdminCommand {
-    /// Create a new API token
-    #[command(name = "create-token")]
-    CreateToken(CreateTokenArgs),
-    /// List API token metadata
-    #[command(name = "list-tokens")]
-    ListTokens,
-    /// Revoke one token or all tokens
-    #[command(name = "revoke-token")]
-    RevokeToken(RevokeTokenArgs),
-    /// Update the locally installed boot binary
-    #[command(name = "update")]
-    Update(crate::update::UpdateArgs),
-}
-
-#[derive(Args)]
 pub struct CreateTokenArgs {
+    /// Server name. Omit with --direct.
+    #[arg(value_name = "SERVER")]
+    pub server: Option<String>,
+    /// Open the local API database directly instead of using the HTTP API
+    #[arg(long, conflicts_with = "server")]
+    pub direct: bool,
     /// Human-readable token name
     #[arg(long)]
     pub name: String,
@@ -60,37 +41,30 @@ pub struct CreateTokenArgs {
     pub save_to: Option<String>,
 }
 
+#[derive(Args, Default)]
+pub struct ListTokensArgs {
+    /// Only list tokens for this server (defaults to all configured servers)
+    #[arg(long, value_name = "SERVER")]
+    pub server: Option<String>,
+    /// Open the local API database directly instead of using the HTTP API
+    #[arg(long, conflicts_with = "server")]
+    pub direct: bool,
+}
+
 #[derive(Args)]
 pub struct RevokeTokenArgs {
-    /// Token id or name to revoke
-    #[arg(value_name = "ID_OR_NAME")]
-    pub selector: Option<String>,
+    /// Server/token selector, or the server name together with --all
+    #[arg(value_name = "SERVER/TOKEN")]
+    pub target: Option<String>,
+    /// Open the local API database directly instead of using the HTTP API
+    #[arg(long)]
+    pub direct: bool,
     /// Revoke every token
     #[arg(long)]
     pub all: bool,
     /// Skip the interactive confirmation
     #[arg(long)]
     pub yes: bool,
-}
-
-pub async fn admin(args: AdminArgs, cli_db: Option<&Path>, api_db: Option<&Path>) -> Result<()> {
-    match args.command {
-        AdminCommand::CreateToken(create) => {
-            create_token(args.server.as_deref(), create, cli_db, api_db).await
-        }
-        AdminCommand::ListTokens => list_tokens(args.server.as_deref(), cli_db, api_db).await,
-        AdminCommand::RevokeToken(revoke) => {
-            revoke_token(args.server.as_deref(), revoke, cli_db, api_db).await
-        }
-        AdminCommand::Update(update) => {
-            if args.server.is_some() {
-                anyhow::bail!(
-                    "boot admin update only updates the local host; --server is not supported"
-                );
-            }
-            crate::update::update(update).await
-        }
-    }
 }
 
 fn target_scopes(read_only: bool, names: &[String]) -> Result<Scopes> {
@@ -136,8 +110,7 @@ fn parse_duration(value: &str) -> Result<i64> {
     Ok(seconds)
 }
 
-async fn create_token(
-    server_name: Option<&str>,
+pub async fn create_token(
     args: CreateTokenArgs,
     cli_db: Option<&Path>,
     api_db: Option<&Path>,
@@ -150,51 +123,7 @@ async fn create_token(
     }
     let expires_in = args.expires_in.as_deref().map(parse_duration).transpose()?;
 
-    let (token, record) = if let Some(server_name) = server_name {
-        if api_db.is_some() {
-            anyhow::bail!("--server and --api-db cannot be used together");
-        }
-        let config = CliDb::open_default(cli_db).await?;
-        let server = config
-            .get_server(server_name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
-        let client = api_client(&server)?;
-        let response = client
-            .create_token(&boot_api_client::types::TokenCreateRequest {
-                name: args.name.clone(),
-                scopes: Some(scopes.names()),
-                expires_in_seconds: expires_in,
-                replace: args.replace,
-            })
-            .await
-            .map_err(|error| {
-                let error = map_error(&server, error.status(), &format_args!("{error:#}"));
-                if error.to_string().contains("lacks the required scope") {
-                    anyhow::anyhow!(
-                        "The stored token for '{}' is not an admin token. Store one with \
-                         boot set-token {} --token-stdin, or use boot admin --api-db on the server host.",
-                        server_name,
-                        server_name
-                    )
-                } else {
-                    error
-                }
-            })?;
-        let body = response.into_inner();
-        (
-            body.token,
-            TokenRecord {
-                id: body.id,
-                name: body.name,
-                token_hash: [0u8; 32],
-                scopes: Scopes::from_names(body.scopes)
-                    .map_err(|message| anyhow::anyhow!(message))?,
-                created_at: body.created_at,
-                expires_at: body.expires_at,
-            },
-        )
-    } else {
+    let (token, record) = if args.direct {
         let path = resolve_api_db_path(api_db)?;
         let db = Store::open(&path).await?;
         let expires_at = match expires_in {
@@ -215,6 +144,55 @@ async fn create_token(
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         (created.token, created.record)
+    } else {
+        let server_name = args
+            .server
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("specify a server name or use --direct"))?;
+        if api_db.is_some() {
+            anyhow::bail!("--api-db requires --direct");
+        }
+        let config = CliDb::open_default(cli_db).await?;
+        let server = config
+            .get_server(server_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+        let client = api_client(&server)?;
+        let response = client
+            .create_token(&boot_api_client::types::TokenCreateRequest {
+                name: args.name.clone(),
+                scopes: Some(scopes.names()),
+                expires_in_seconds: expires_in,
+                replace: args.replace,
+            })
+            .await
+            .map_err(|error| {
+                let error = map_error(&server, error.status(), &format_args!("{error:#}"));
+                if error.to_string().contains("lacks the required scope") {
+                    anyhow::anyhow!(
+                        "The stored token for '{}' is not an admin token. Store one with \
+                         boot edit-server {} --token-stdin, or use boot create-token --direct \
+                         --api-db on the server host.",
+                        server_name,
+                        server_name
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let body = response.into_inner();
+        (
+            body.token,
+            TokenRecord {
+                id: body.id,
+                name: body.name,
+                token_hash: [0u8; 32],
+                scopes: Scopes::from_names(body.scopes)
+                    .map_err(|message| anyhow::anyhow!(message))?,
+                created_at: body.created_at,
+                expires_at: body.expires_at,
+            },
+        )
     };
 
     println!("{token}");
@@ -229,7 +207,7 @@ async fn create_token(
         if let Err(error) = save_token(cli_db, &save_to, &token).await {
             eprintln!(
                 "Warning: could not store the token for '{}': {}. The token is valid; run: \
-                 boot set-token {} --token-stdin",
+                 boot edit-server {} --token-stdin",
                 save_to, error, save_to
             );
         }
@@ -249,93 +227,136 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-async fn list_tokens(
-    server_name: Option<&str>,
+struct ListedToken {
+    server: Option<String>,
+    record: TokenRecord,
+    current: bool,
+}
+
+pub async fn list_tokens(
+    args: ListTokensArgs,
     cli_db: Option<&Path>,
     api_db: Option<&Path>,
 ) -> Result<()> {
-    let tokens: Vec<TokenRecord>;
-    let mut current: Option<String> = None;
-    if let Some(server_name) = server_name {
-        if api_db.is_some() {
-            anyhow::bail!("--server and --api-db cannot be used together");
-        }
-        let config = CliDb::open_default(cli_db).await?;
-        let server = config
-            .get_server(server_name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
-        let client = api_client(&server)?;
-        let response = client.list_tokens().await.map_err(|error| {
-            let error = map_error(&server, error.status(), &format_args!("{error:#}"));
-            if error.to_string().contains("lacks the required scope") {
-                anyhow::anyhow!(
-                    "The stored token for '{}' is not an admin token. Store one with \
-                     boot set-token {} --token-stdin, or use boot admin --api-db on the server host.",
-                    server_name,
-                    server_name
-                )
-            } else {
-                error
-            }
-        })?;
-        tokens = response
-            .into_inner()
-            .into_iter()
-            .map(|summary| {
-                if summary.current {
-                    current = Some(summary.id.clone());
-                }
-                TokenRecord {
-                    id: summary.id,
-                    name: summary.name,
-                    token_hash: [0u8; 32],
-                    scopes: Scopes::from_names(summary.scopes).unwrap_or_else(|_| Scopes::read()),
-                    created_at: summary.created_at,
-                    expires_at: summary.expires_at,
-                }
-            })
-            .collect();
-    } else {
+    if args.direct {
         let path = resolve_api_db_path(api_db)?;
         let db = Store::open(&path).await?;
-        tokens = db
+        let rows = db
             .list_tokens()
             .await
-            .map_err(|error| anyhow::anyhow!(error))?;
+            .map_err(|error| anyhow::anyhow!(error))?
+            .into_iter()
+            .map(|record| ListedToken {
+                server: None,
+                record,
+                current: false,
+            })
+            .collect::<Vec<_>>();
+        print_token_table(&rows, false);
+        return Ok(());
     }
 
-    print_token_table(&tokens, current.as_deref());
+    if api_db.is_some() {
+        anyhow::bail!("--api-db requires --direct");
+    }
+    let config = CliDb::open_default(cli_db).await?;
+    let servers = match args.server.as_deref() {
+        Some(name) => {
+            let server = config
+                .get_server(name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+            vec![server]
+        }
+        None => config.list_servers().await?,
+    };
+    if servers.is_empty() {
+        println!("No servers configured.");
+        return Ok(());
+    }
+
+    let mut rows = Vec::new();
+    for server in servers {
+        let client = match api_client(&server) {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("Error connecting to server '{}': {}", server.name, error);
+                continue;
+            }
+        };
+        match client.list_tokens().await {
+            Ok(response) => {
+                for summary in response.into_inner() {
+                    rows.push(ListedToken {
+                        server: Some(server.name.clone()),
+                        record: TokenRecord {
+                            id: summary.id,
+                            name: summary.name,
+                            token_hash: [0u8; 32],
+                            scopes: Scopes::from_names(summary.scopes)
+                                .unwrap_or_else(|_| Scopes::read()),
+                            created_at: summary.created_at,
+                            expires_at: summary.expires_at,
+                        },
+                        current: summary.current,
+                    });
+                }
+            }
+            Err(error) => {
+                let message = map_error(&server, error.status(), &format_args!("{error:#}"));
+                eprintln!(
+                    "Error listing tokens on server '{}' ({}): {}",
+                    server.name, server.url, message
+                );
+            }
+        }
+    }
+
+    print_token_table(&rows, true);
     Ok(())
 }
 
-fn print_token_table(tokens: &[TokenRecord], current: Option<&str>) {
-    if tokens.is_empty() {
+fn print_token_table(rows: &[ListedToken], show_server: bool) {
+    if rows.is_empty() {
         println!("No tokens.");
         return;
     }
     let mut table = comfy_table::Table::new();
     table.load_style(comfy_table::presets::NOTHING);
-    table.set_header(vec!["ID", "NAME", "SCOPES", "CREATED", "EXPIRES", ""]);
-    for token in tokens {
-        let marker = if Some(token.id.as_str()) == current {
-            "current"
-        } else {
-            ""
-        };
-        table.add_row(vec![
-            comfy_table::Cell::new(&token.id),
-            comfy_table::Cell::new(&token.name),
-            comfy_table::Cell::new(token.scopes.display()),
-            comfy_table::Cell::new(format_timestamp(token.created_at)),
+    if show_server {
+        table.set_header(vec![
+            "SERVER", "ID", "NAME", "SCOPES", "CREATED", "EXPIRES", "",
+        ]);
+    } else {
+        table.set_header(vec!["ID", "NAME", "SCOPES", "CREATED", "EXPIRES"]);
+    }
+    for row in rows {
+        let mut cells = Vec::new();
+        if show_server {
+            cells.push(comfy_table::Cell::new(
+                row.server.as_deref().unwrap_or("direct"),
+            ));
+        }
+        cells.extend([
+            comfy_table::Cell::new(&row.record.id),
+            comfy_table::Cell::new(&row.record.name),
+            comfy_table::Cell::new(row.record.scopes.display()),
+            comfy_table::Cell::new(format_timestamp(row.record.created_at)),
             comfy_table::Cell::new(
-                token
+                row.record
                     .expires_at
                     .map(format_timestamp)
                     .unwrap_or_else(|| "never".to_string()),
             ),
-            comfy_table::Cell::new(marker),
         ]);
+        if show_server {
+            cells.push(comfy_table::Cell::new(if row.current {
+                "current"
+            } else {
+                ""
+            }));
+        }
+        table.add_row(cells);
     }
     println!("{table}");
 }
@@ -366,109 +387,145 @@ pub(crate) fn confirm(prompt: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn revoke_token(
-    server_name: Option<&str>,
+pub async fn revoke_token(
     args: RevokeTokenArgs,
     cli_db: Option<&Path>,
     api_db: Option<&Path>,
 ) -> Result<()> {
-    if args.all && args.selector.is_some() {
-        anyhow::bail!("specify either a selector or --all, not both");
+    if args.direct {
+        return revoke_token_direct(args, api_db).await;
     }
-    if !args.all && args.selector.is_none() {
+    if api_db.is_some() {
+        anyhow::bail!("--api-db requires --direct");
+    }
+    revoke_token_api(args, cli_db).await
+}
+
+async fn revoke_token_direct(args: RevokeTokenArgs, api_db: Option<&Path>) -> Result<()> {
+    if args.all && args.target.is_some() {
+        anyhow::bail!("specify either a token selector or --all, not both");
+    }
+    if !args.all && args.target.is_none() {
         anyhow::bail!("specify a token id/name or --all");
     }
+    if let Some(target) = args.target.as_deref() {
+        if target.contains('/') {
+            anyhow::bail!("with --direct, pass a token id or name without a server prefix");
+        }
+    }
     if args.all {
-        eprintln!("Warning: this revokes every API token, including admin tokens.");
-        confirm("Revoke every token? This cannot be undone.", args.yes)?;
+        eprintln!("This removes the local API database's tokens. The server may still be running.");
+        confirm("Revoke all tokens from the local API database?", args.yes)?;
     }
 
-    let revoked = if let Some(server_name) = server_name {
-        if api_db.is_some() {
-            anyhow::bail!("--server and --api-db cannot be used together");
+    let path = resolve_api_db_path(api_db)?;
+    let db = Store::open(&path).await?;
+    let revoked = if args.all {
+        db.revoke_all()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))? as u32
+    } else {
+        db.revoke_token(args.target.as_deref().unwrap())
+            .await
+            .map_err(|error| anyhow::anyhow!(error))? as u32
+    };
+    println!("Revoked {revoked} token(s)");
+    Ok(())
+}
+
+async fn revoke_token_api(args: RevokeTokenArgs, cli_db: Option<&Path>) -> Result<()> {
+    let config = CliDb::open_default(cli_db).await?;
+    if args.all {
+        let server_name = args
+            .target
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("specify a server name with --all"))?;
+        if server_name.contains('/') {
+            anyhow::bail!("with --all, pass the server name without a token selector");
         }
-        let config = CliDb::open_default(cli_db).await?;
         let server = config
             .get_server(server_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
         let client = api_client(&server)?;
+        eprintln!("This removes every API token on '{}'.", server.name);
+        confirm("Revoke every token? This cannot be undone.", args.yes)?;
+        let revoked = client
+            .revoke_all_tokens(Some(true))
+            .await
+            .map_err(|error| {
+                admin_scope_error(&server, error.status(), &format_args!("{error:#}"))
+            })?
+            .into_inner()
+            .revoked as u32;
+        println!("Revoked {revoked} token(s)");
+        return Ok(());
+    }
 
-        if args.all {
-            client
-                .revoke_all_tokens(Some(true))
-                .await
-                .map_err(|error| {
-                    let error = map_error(&server, error.status(), &format_args!("{error:#}"));
-                    if error.to_string().contains("lacks the required scope") {
-                        anyhow::anyhow!(
-                            "The stored token for '{}' is not an admin token. Store one with \
-                             boot set-token {} --token-stdin, or use boot admin --api-db on the server host.",
-                            server_name,
-                            server_name
-                        )
-                    } else {
-                        error
-                    }
-                })?
-                .into_inner()
-                .revoked as u32
-        } else {
-            let selector = args.selector.as_deref().unwrap();
-            let current = current_token(&client, &server).await.ok().flatten();
-            if current
-                .as_ref()
-                .is_some_and(|(id, name)| selector == id || selector == name)
-            {
-                eprintln!(
-                    "Warning: '{}' is the token used by this command. Revoking it will                      immediately end this admin session.",
-                    selector
-                );
-                if !args.yes {
-                    confirm(
-                        "The token you are revoking is the one used by this command. Continue?",
-                        false,
-                    )?;
-                }
-            }
-            client
-                .revoke_token(selector)
-                .await
-                .map_err(|error| {
-                    if error.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-                        return anyhow::anyhow!(
-                            "No token matches '{}'. Run: boot admin list-tokens",
-                            selector
-                        );
-                    }
-                    let error = map_error(&server, error.status(), &format_args!("{error:#}"));
-                    if error.to_string().contains("lacks the required scope") {
-                        anyhow::anyhow!(
-                            "The stored token for '{}' is not an admin token. Store one with \
-                             boot set-token {} --token-stdin, or use boot admin --api-db on the server host.",
-                            server_name,
-                            server_name
-                        )
-                    } else {
-                        error
-                    }
-                })?
-                .into_inner()
-                .revoked as u32
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("specify <server>/<token-id> or use --all"))?;
+    let (server_name, selector) = target
+        .split_once('/')
+        .filter(|(server, token)| !server.is_empty() && !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("expected <server>/<token-id>"))?;
+    let server = config
+        .get_server(server_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+    let client = api_client(&server)?;
+    let current = current_token(&client, &server).await.ok().flatten();
+    if current
+        .as_ref()
+        .is_some_and(|(id, name)| selector == id || selector == name)
+    {
+        eprintln!(
+            "Warning: '{}' is the token used by this command. Revoking it will immediately end this admin session.",
+            selector
+        );
+        if !args.yes {
+            confirm(
+                "The token you are revoking is the one used by this command. Continue?",
+                false,
+            )?;
         }
-    } else {
-        let path = resolve_api_db_path(api_db)?;
-        let db = Store::open(&path).await?;
-        let result = if args.all {
-            db.revoke_all().await
-        } else {
-            db.revoke_token(args.selector.as_deref().unwrap()).await
-        };
-        result.map_err(|error| anyhow::anyhow!(error))? as u32
-    };
-
-    println!("Revoked {} token(s)", revoked);
+    }
+    let revoked = client
+        .revoke_token(selector)
+        .await
+        .map_err(|error| {
+            if error.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                return anyhow::anyhow!(
+                    "No token matches '{}'. Run: boot list-tokens --server {}",
+                    selector,
+                    server_name
+                );
+            }
+            admin_scope_error(&server, error.status(), &format_args!("{error:#}"))
+        })?
+        .into_inner()
+        .revoked as u32;
+    println!("Revoked {revoked} token(s)");
     Ok(())
+}
+
+fn admin_scope_error(
+    server: &ServerEntry,
+    status: Option<reqwest::StatusCode>,
+    error: &dyn std::fmt::Display,
+) -> anyhow::Error {
+    let error = map_error(server, status, error);
+    if error.to_string().contains("lacks the required scope") {
+        anyhow::anyhow!(
+            "The stored token for '{}' is not an admin token. Store one with \
+             boot edit-server {} --token-stdin, or use --direct on the server host.",
+            server.name,
+            server.name
+        )
+    } else {
+        error
+    }
 }
 
 async fn current_token(

@@ -1,4 +1,4 @@
-//! `boot admin update` — replace the locally installed binary with a release
+//! `boot update` — replace the locally installed binary with a release
 //! published on GitHub.
 
 use std::env;
@@ -296,7 +296,7 @@ fn current_executable() -> Result<PathBuf> {
 
 fn current_target() -> Result<&'static str> {
     if !cfg!(target_env = "gnu") {
-        anyhow::bail!("boot admin update only supports glibc targets");
+        anyhow::bail!("boot update only supports glibc targets");
     }
     match (env::consts::ARCH, env::consts::OS) {
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
