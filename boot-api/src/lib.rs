@@ -49,6 +49,11 @@ pub struct ArtifactPath {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SetArtifactRequest {
+    pub artifact: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SubscriberPath {
     pub id: String,
     pub subscriber_id: String,
@@ -291,6 +296,37 @@ trait BootApi {
         path: Path<IdPath>,
         body: TypedBody<ProbeSessionRequest>,
     ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError>;
+
+    #[endpoint {
+        method = PUT,
+        path = "/v1/sessions/{id}/artifact",
+    }]
+    async fn set_session_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<SetArtifactRequest>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    #[endpoint {
+        method = DELETE,
+        path = "/v1/sessions/{id}/artifact",
+    }]
+    async fn delete_session_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    #[endpoint {
+        method = DELETE,
+        path = "/v1/probes/{id}/artifact",
+    }]
+    async fn delete_probe_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError>;
 
     #[endpoint {
         method = POST,

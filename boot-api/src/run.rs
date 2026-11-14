@@ -28,7 +28,8 @@ use crate::{
     DeleteSessionQuery, Empty, ExportQuery, FlashRequest, FollowQuery, IdPath, InspectRequest,
     IoQuery, ListQuery, Probe, ProbeSessionRequest, ResetRequest, RevokeAllQuery, RevokeResult,
     SerialPort, SerialSessionRequest, ServerStatus, Session, SessionPatch, SessionWsMessage,
-    Subscriber, SubscriberPath, TokenCreateRequest, TokenCreated, TokenPath, TokenSummary,
+    SetArtifactRequest, Subscriber, SubscriberPath, TokenCreateRequest, TokenCreated, TokenPath,
+    TokenSummary,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -56,8 +57,10 @@ fn map_error(error: RuntimeError) -> HttpError {
         "resource_busy" | "conflict" | "not_resumable" | "dap_exclusive" | "session_active" => {
             dropshot::ClientErrorStatusCode::CONFLICT
         }
-        "invalid_request" => dropshot::ClientErrorStatusCode::BAD_REQUEST,
-        "artifact_expired" => dropshot::ClientErrorStatusCode::GONE,
+        "invalid_request" | "invalid_artifact" | "not_rtt_session" => {
+            dropshot::ClientErrorStatusCode::BAD_REQUEST
+        }
+        "artifact_in_use" | "session_closed" => dropshot::ClientErrorStatusCode::CONFLICT,
         "storage_exhausted" => dropshot::ClientErrorStatusCode::TOO_MANY_REQUESTS,
         _ => return HttpError::for_internal_error(error.message),
     };
@@ -80,7 +83,7 @@ fn location(uri: String) -> http::HeaderValue {
     http::HeaderValue::from_str(&uri).expect("valid location header")
 }
 
-fn probe_from_resource(resource: &runtime::ResourceEntry) -> Probe {
+fn probe_from_resource(runtime: &Runtime, resource: &runtime::ResourceEntry) -> Probe {
     Probe {
         id: resource.id.clone(),
         name: resource.name.clone(),
@@ -95,6 +98,7 @@ fn probe_from_resource(resource: &runtime::ResourceEntry) -> Probe {
         generation: resource.generation,
         state: resource.state.clone(),
         identity_stable: resource.identity_stable,
+        last_artifact: runtime.probe_artifact(&resource.id),
     }
 }
 
@@ -168,7 +172,7 @@ impl BootApi for ServerImpl {
                 .resources()
                 .iter()
                 .filter(|resource| resource.kind == runtime::ResourceKind::Probe)
-                .map(probe_from_resource)
+                .map(|resource| probe_from_resource(runtime, resource))
                 .collect(),
         ))
     }
@@ -182,7 +186,7 @@ impl BootApi for ServerImpl {
         let resource = runtime
             .resource(&path.into_inner().id)
             .ok_or_else(|| HttpError::for_not_found(None, "probe not found".to_string()))?;
-        Ok(HttpResponseOk(probe_from_resource(&resource)))
+        Ok(HttpResponseOk(probe_from_resource(runtime, &resource)))
     }
 
     async fn serial_ports(
@@ -375,6 +379,8 @@ impl BootApi for ServerImpl {
                 &path.into_inner().id,
                 &request.kind,
                 request.options,
+                request.artifact.as_deref(),
+                request.inherit_artifact,
                 &auth.principal().id,
                 request.max_subscribers,
                 request.detach_timeout_seconds,
@@ -387,6 +393,46 @@ impl BootApi for ServerImpl {
             .headers_mut()
             .insert(LOCATION, location(format!("/v1/sessions/{}", session.id)));
         Ok(response)
+    }
+
+    async fn set_session_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+        body: TypedBody<SetArtifactRequest>,
+    ) -> Result<HttpResponseOk<Session>, HttpError> {
+        let runtime = runtime(&rqctx)?;
+        let session = runtime
+            .set_session_artifact(&path.into_inner().id, &body.into_inner().artifact)
+            .await
+            .map_err(map_error)?;
+        Ok(HttpResponseOk(session))
+    }
+
+    async fn delete_session_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Session>, HttpError> {
+        let runtime = runtime(&rqctx)?;
+        let session = runtime
+            .clear_session_artifact(&path.into_inner().id)
+            .await
+            .map_err(map_error)?;
+        Ok(HttpResponseOk(session))
+    }
+
+    async fn delete_probe_artifact(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Control>,
+        path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<Empty>, HttpError> {
+        let runtime = runtime(&rqctx)?;
+        runtime
+            .clear_probe_artifact(&path.into_inner().id)
+            .await
+            .map_err(map_error)?;
+        Ok(HttpResponseOk(Empty {}))
     }
 
     async fn create_serial_session(
@@ -570,7 +616,7 @@ impl BootApi for ServerImpl {
             ));
         }
         let include_input = query.include_input.unwrap_or(false);
-        let records = handle.replay_records(0);
+        let events = handle.replay(0, include_input);
         let mut lines = Vec::new();
         lines.push(
             serde_json::json!({
@@ -582,28 +628,29 @@ impl BootApi for ServerImpl {
             })
             .to_string(),
         );
-        let mut last_ms = records
-            .first()
-            .map(|record| record.timestamp_ms)
-            .unwrap_or(0);
-        for record in records {
-            let text = match String::from_utf8(record.payload.clone()) {
-                Ok(text) => text,
-                Err(_) => {
-                    return Err(HttpError::for_client_error(
-                        None,
-                        dropshot::ClientErrorStatusCode::CONFLICT,
-                        "session contains non-UTF-8 data; use a binary export".to_string(),
-                    ));
+        let mut last_ms = events.first().map(|event| event.timestamp_ms).unwrap_or(0);
+        for event in events {
+            use runtime::session::SessionEventData;
+            let (text, code) = match &event.data {
+                SessionEventData::Bytes(data) => (utf8_text(data)?, "o"),
+                SessionEventData::Input(data) => (utf8_text(data)?, "i"),
+                SessionEventData::RttRecords { records, raw, .. } => {
+                    let mut text = records
+                        .iter()
+                        .map(boot_protocol::RttRecord::display_line)
+                        .collect::<String>();
+                    if let Some(raw) = raw {
+                        text.push_str(&String::from_utf8_lossy(raw));
+                    }
+                    (text, "o")
                 }
+                SessionEventData::RttRaw { data, .. } => (utf8_text(data)?, "o"),
             };
-            let code = match record.kind {
-                crate::runtime::session_log::RECORD_OUTPUT => "o",
-                crate::runtime::session_log::RECORD_INPUT if include_input => "i",
-                _ => continue,
-            };
-            let interval = (record.timestamp_ms.saturating_sub(last_ms)) as f64 / 1000.0;
-            last_ms = record.timestamp_ms;
+            if text.is_empty() {
+                continue;
+            }
+            let interval = (event.timestamp_ms.saturating_sub(last_ms)) as f64 / 1000.0;
+            last_ms = event.timestamp_ms;
             lines.push(serde_json::json!([interval, code, text]).to_string());
         }
         let cast = format!("{}\n", lines.join("\n"));
@@ -1000,20 +1047,9 @@ async fn session_io_ws(
     };
     send_json(&mut tx, &hello).await?;
     let mut cursor = after;
-    for (seq, channel, data, input) in handle.replay(after, include_input) {
-        if input {
-            send_json(
-                &mut tx,
-                &SessionWsMessage::Input {
-                    seq,
-                    data: base64_encode(&data),
-                },
-            )
-            .await?;
-        } else {
-            send_binary(&mut tx, &handle.kind, seq, channel, &data).await?;
-        }
-        cursor = cursor.max(seq);
+    for event in handle.replay(after, include_input) {
+        cursor = cursor.max(event.seq);
+        send_session_event(&mut tx, &handle.kind, &event).await?;
     }
     if matches!(snapshot.state.as_str(), "closed" | "failed" | "suspended") {
         let _ = send_json(
@@ -1033,12 +1069,13 @@ async fn session_io_ws(
         return Ok(());
     }
     let mut lifecycle = handle.lifecycle_tx.subscribe();
+    let mut decode_epoch = snapshot.decode.epoch;
     'session_loop: loop {
         let chunks = handle.read_after(cursor);
         if !chunks.is_empty() {
-            for (seq, channel, data) in chunks {
-                send_binary(&mut tx, &handle.kind, seq, channel, &data).await?;
-                cursor = seq;
+            for event in chunks {
+                cursor = event.seq;
+                send_session_event(&mut tx, &handle.kind, &event).await?;
             }
             continue;
         }
@@ -1052,6 +1089,16 @@ async fn session_io_ws(
             event = lifecycle.recv() => {
                 match event {
                     Ok(session) => {
+                        if session.decode.epoch != decode_epoch {
+                            decode_epoch = session.decode.epoch;
+                            send_json(
+                                &mut tx,
+                                &SessionWsMessage::DecoderChanged {
+                                    session: session.clone(),
+                                },
+                            )
+                            .await?;
+                        }
                         if session.state == "closed" {
                             send_json(&mut tx, &SessionWsMessage::Ended { session }).await?;
                             break 'session_loop;
@@ -1133,6 +1180,111 @@ where
     Ok(())
 }
 
+async fn send_session_event<S>(
+    tx: &mut S,
+    kind: &str,
+    event: &runtime::session::SessionEvent,
+) -> WsResult
+where
+    S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    use runtime::session::SessionEventData;
+    match &event.data {
+        SessionEventData::Bytes(data) => {
+            send_binary(tx, kind, event.seq, event.channel, data).await
+        }
+        SessionEventData::Input(data) => {
+            send_json(
+                tx,
+                &SessionWsMessage::Input {
+                    seq: event.seq,
+                    data: base64_encode(data),
+                },
+            )
+            .await
+        }
+        SessionEventData::RttRecords {
+            epoch,
+            records,
+            raw,
+            error,
+        } => {
+            if !records.is_empty() {
+                send_json(
+                    tx,
+                    &SessionWsMessage::RttRecords {
+                        seq: event.seq,
+                        channel: event.channel,
+                        epoch: *epoch,
+                        records: records.clone(),
+                    },
+                )
+                .await?;
+            }
+            if let Some(raw) = raw {
+                send_json(
+                    tx,
+                    &SessionWsMessage::RttRaw {
+                        seq: event.seq,
+                        channel: event.channel,
+                        epoch: *epoch,
+                        data: base64_encode(raw),
+                    },
+                )
+                .await?;
+            }
+            if let Some(message) = error {
+                send_json(
+                    tx,
+                    &SessionWsMessage::RttDecodeError {
+                        seq: event.seq,
+                        channel: event.channel,
+                        epoch: *epoch,
+                        message: message.clone(),
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        SessionEventData::RttRaw { epoch, data, error } => {
+            send_json(
+                tx,
+                &SessionWsMessage::RttRaw {
+                    seq: event.seq,
+                    channel: event.channel,
+                    epoch: *epoch,
+                    data: base64_encode(data),
+                },
+            )
+            .await?;
+            if let Some(message) = error {
+                send_json(
+                    tx,
+                    &SessionWsMessage::RttDecodeError {
+                        seq: event.seq,
+                        channel: event.channel,
+                        epoch: *epoch,
+                        message: message.clone(),
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn utf8_text(data: &[u8]) -> Result<String, HttpError> {
+    String::from_utf8(data.to_vec()).map_err(|_| {
+        HttpError::for_client_error(
+            None,
+            dropshot::ClientErrorStatusCode::CONFLICT,
+            "session contains non-UTF-8 data; use a binary export".to_string(),
+        )
+    })
+}
+
 type WsResult = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1151,6 +1303,7 @@ mod tests {
 
     use crate::auth::{AuthState, CreateTokenRequest, Scopes};
     use crate::runtime::RuntimeConfig;
+    use crate::store::{ProbeArtifactRecord, RuntimeStore};
 
     struct TestServer {
         context: TestContext<AuthState>,
@@ -1332,6 +1485,7 @@ mod tests {
             .await;
         let artifact: crate::Artifact = read_json(&mut response).await;
         assert_eq!(artifact.size, 14);
+        assert!(!artifact.in_use);
         let mut response = server
             .send(
                 server.request(
@@ -1345,6 +1499,125 @@ mod tests {
             .await;
         let fetched: crate::Artifact = read_json(&mut response).await;
         assert_eq!(fetched.sha256, artifact.sha256);
+        assert!(!fetched.in_use);
+        server.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_delete_rejects_references() {
+        let server = TestServer::new("artifact-delete").await;
+        let control = server.create("control", Scopes::control()).await;
+        let mut response = server
+            .send(
+                server.request(Method::POST, "/v1/artifacts", Some(&control), "bytes"),
+                StatusCode::CREATED,
+            )
+            .await;
+        let artifact: crate::Artifact = read_json(&mut response).await;
+        server
+            .db
+            .add_artifact_ref(&artifact.id, "session", "ses_test", 1)
+            .await
+            .unwrap();
+        server
+            .send(
+                server.request(
+                    Method::DELETE,
+                    &format!("/v1/artifacts/{}", artifact.id),
+                    Some(&control),
+                    "",
+                ),
+                StatusCode::CONFLICT,
+            )
+            .await;
+        let mut response = server
+            .send(
+                server.request(
+                    Method::GET,
+                    &format!("/v1/artifacts/{}", artifact.id),
+                    Some(&control),
+                    "",
+                ),
+                StatusCode::OK,
+            )
+            .await;
+        let fetched: crate::Artifact = read_json(&mut response).await;
+        assert!(fetched.in_use);
+        server
+            .db
+            .remove_artifact_ref(&artifact.id, "session", "ses_test")
+            .await
+            .unwrap();
+        server
+            .send(
+                server.request(
+                    Method::DELETE,
+                    &format!("/v1/artifacts/{}", artifact.id),
+                    Some(&control),
+                    "",
+                ),
+                StatusCode::OK,
+            )
+            .await;
+        server.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn probe_artifact_delete_releases_reference() {
+        let server = TestServer::new("probe-artifact-delete").await;
+        let control = server.create("control", Scopes::control()).await;
+        let mut response = server
+            .send(
+                server.request(Method::POST, "/v1/artifacts", Some(&control), "bytes"),
+                StatusCode::CREATED,
+            )
+            .await;
+        let artifact: crate::Artifact = read_json(&mut response).await;
+        server
+            .db
+            .upsert_probe_artifact(&ProbeArtifactRecord {
+                resource_id: "probe_test".into(),
+                artifact_id: artifact.id.clone(),
+                sha256: artifact.sha256.clone(),
+                size: artifact.size as i64,
+                defmt: 1,
+                rtt_addr: Some("0x2000".into()),
+                change_id: Some("chg_test".into()),
+                created_by: Some("principal".into()),
+                flashed_at: 1,
+            })
+            .await
+            .unwrap();
+        server
+            .send(
+                server.request(
+                    Method::DELETE,
+                    "/v1/probes/probe_test/artifact",
+                    Some(&control),
+                    "",
+                ),
+                StatusCode::OK,
+            )
+            .await;
+        assert!(
+            server
+                .db
+                .load_probe_artifact("probe_test")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server
+            .send(
+                server.request(
+                    Method::DELETE,
+                    &format!("/v1/artifacts/{}", artifact.id),
+                    Some(&control),
+                    "",
+                ),
+                StatusCode::OK,
+            )
+            .await;
         server.teardown().await;
     }
 }

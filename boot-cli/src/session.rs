@@ -42,6 +42,18 @@ pub async fn list_sessions(cli_db: Option<&std::path::Path>) -> Result<()> {
         match client.list_sessions(Some("all")).await {
             Ok(response) => {
                 for session in response.into_inner() {
+                    let decoder = session
+                        .decode
+                        .artifact
+                        .as_ref()
+                        .map(|artifact| {
+                            format!(
+                                "{}:{}...",
+                                session.decode.mode,
+                                artifact.id.chars().take(12).collect::<String>()
+                            )
+                        })
+                        .unwrap_or_else(|| "raw".to_string());
                     table.add_row(vec![
                         server.name.clone(),
                         session.id,
@@ -50,6 +62,7 @@ pub async fn list_sessions(cli_db: Option<&std::path::Path>) -> Result<()> {
                         session.resource_id,
                         session.subscribers.to_string(),
                         session.data.bytes.to_string(),
+                        decoder,
                     ]);
                 }
             }
@@ -121,16 +134,40 @@ pub async fn replay_session(
                 }
             }
             Message::Text(text) => {
-                if let Ok(boot_protocol::SessionWsMessage::Input { data, .. }) =
-                    serde_json::from_str::<boot_protocol::SessionWsMessage>(&text)
-                {
-                    use base64::Engine;
-                    if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
-                        stdout.write_all(b"> ").await?;
-                        stdout.write_all(&bytes).await?;
-                        stdout.write_all(b"\n").await?;
+                match serde_json::from_str::<boot_protocol::SessionWsMessage>(&text) {
+                    Ok(boot_protocol::SessionWsMessage::Input { data, .. }) => {
+                        use base64::Engine;
+                        if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
+                            stdout.write_all(b"> ").await?;
+                            stdout.write_all(&bytes).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    Ok(boot_protocol::SessionWsMessage::RttRecords { records, .. }) => {
+                        for record in records {
+                            stdout.write_all(record.display_line().as_bytes()).await?;
+                        }
                         stdout.flush().await?;
                     }
+                    Ok(boot_protocol::SessionWsMessage::RttRaw { data, .. }) => {
+                        use base64::Engine;
+                        if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
+                            stdout
+                                .write_all(
+                                    &String::from_utf8_lossy(&bytes).into_owned().into_bytes(),
+                                )
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    Ok(boot_protocol::SessionWsMessage::RttDecodeError { message, .. }) => {
+                        eprintln!("decoder: {message}");
+                    }
+                    Ok(boot_protocol::SessionWsMessage::Error { message, .. }) => {
+                        eprintln!("{message}");
+                    }
+                    _ => {}
                 }
             }
             Message::Close(_) => break,

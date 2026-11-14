@@ -221,6 +221,14 @@ mod tests {
         for args in [
             vec!["boot", "run-firmware", "local/probe", "firmware.elf"],
             vec!["boot", "attach-probe", "local/probe"],
+            vec![
+                "boot",
+                "attach-probe",
+                "local/probe",
+                "--artifact",
+                "art_test",
+            ],
+            vec!["boot", "attach-probe", "local/probe", "--clear-artifact"],
             vec!["boot", "start-dap", "local/probe"],
             vec!["boot", "attach-serial", "local/tty"],
             vec!["boot", "replay-session", "local/ses"],

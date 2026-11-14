@@ -506,6 +506,64 @@ mod tests {
         assert_ne!(generate_token(), generate_token());
     }
 
+    #[tokio::test]
+    async fn artifacts_track_references_and_probe_records() {
+        let path = temp_path("artifact-refs");
+        let db = Store::open(&path).await.unwrap();
+        db.insert_artifact(&ArtifactRecord {
+            id: "art_test".into(),
+            path: "/tmp/art_test.bin".into(),
+            size: 3,
+            sha256: "abc".into(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+        assert!(!db.artifact_in_use("art_test").await.unwrap());
+
+        db.add_artifact_ref("art_test", "session", "ses_test", 2)
+            .await
+            .unwrap();
+        assert!(db.artifact_in_use("art_test").await.unwrap());
+        db.remove_artifact_ref("art_test", "session", "ses_test")
+            .await
+            .unwrap();
+        assert!(!db.artifact_in_use("art_test").await.unwrap());
+
+        db.upsert_probe_artifact(&ProbeArtifactRecord {
+            resource_id: "probe_test".into(),
+            artifact_id: "art_test".into(),
+            sha256: "abc".into(),
+            size: 3,
+            defmt: 1,
+            rtt_addr: Some("0x2000".into()),
+            change_id: Some("chg_test".into()),
+            created_by: Some("principal".into()),
+            flashed_at: 3,
+        })
+        .await
+        .unwrap();
+        assert!(db.artifact_in_use("art_test").await.unwrap());
+        assert_eq!(
+            db.load_probe_artifact("probe_test")
+                .await
+                .unwrap()
+                .unwrap()
+                .artifact_id,
+            "art_test"
+        );
+        assert_eq!(db.load_probe_artifacts().await.unwrap().len(), 1);
+
+        db.delete_probe_artifact("probe_test").await.unwrap();
+        assert!(!db.artifact_in_use("art_test").await.unwrap());
+        assert!(
+            db.load_probe_artifact("probe_test")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_group_or_world_readable_database() {

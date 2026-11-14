@@ -272,7 +272,7 @@ Until then, use the vocabulary and status discipline, not the library.
 | **Task** | One stage of a change with its own status/progress/log | Change actor | Same as the change |
 | **Session** | Long-lived streaming access to a resource: RTT, serial, or DAP. One producer/lease, zero or more data subscribers | Session manager + session actor | Serial/RTT metadata/data retained for replay; DAP metadata only |
 | **Subscriber** | One client attached to a session's data plane, with its own cursor, principal, and read/write mode | Session actor / subscriber actor | Until its socket closes or it is kicked |
-| **Artifact** | An uploaded firmware file, identified by ID and SHA-256 | Artifact store | TTL or explicit delete |
+| **Artifact** | An uploaded firmware file, identified by ID and SHA-256 | Artifact store | Until explicit delete |
 | **Change update** | A snapshot or log entry pushed to the followers of one change | Change actor | Per-change bounded replay history |
 | **Principal** | The token identity performing an operation | Auth store | Token lifetime |
 
@@ -957,12 +957,13 @@ The current base64 body is replaced by an upload:
 1. `POST /v1/artifacts` with `Content-Type: application/octet-stream` streams the
    body to a temporary file in a `0700` spool directory.
 2. The server enforces a maximum size (default 64 MiB), computes SHA-256, sets
-   file mode `0600`, and returns `201` with `{id, size, sha256, expires_at}`.
+   file mode `0600`, and returns `201` with `{id, size, sha256, in_use}`.
 3. `POST /v1/probes/{id}/flash` references the returned `artifact` ID.
-4. The artifact is readable for a TTL (default 1 hour) and deleted by a reaper
-   or on explicit `DELETE /v1/artifacts/{id}`.
+4. Artifacts do not expire. They remain until explicit
+   `DELETE /v1/artifacts/{id}`; deletion is refused while a session, probe
+   last-flash record, or in-flight flash change references the artifact.
 5. The change validates the artifact and passes its path to the probe worker.
-6. Startup removes stale files that are not referenced by a live change.
+6. There is no artifact reaper or startup cleanup pass.
 
 The artifact store never derives paths from client input. It maps IDs to
 server-generated file names. The legacy `/v1` flash endpoint decodes base64 into
@@ -1154,23 +1155,25 @@ wakes it when new data arrives. The session actor never pushes into a
 subscriber's bounded mailbox, so there is no actor cycle and no deadlock between
 a slow socket writer and the producer.
 
-| Kind | Server → client binary frame | Client → server binary frame | Fanout | Resume |
+| Kind | Server → client frame | Client → server binary frame | Fanout | Resume |
 | --- | --- | --- | --- | --- |
-| `serial` | `u64 seq (big-endian) + payload` | raw payload | Many; any control subscriber may write | Yes, durable log |
-| `rtt` | `u64 seq + u8 channel + payload` | ignored / control only | Many read-only | Yes, durable log |
+| `serial` | binary `u64 seq (big-endian) + payload` | raw payload | Many; any control subscriber may write | Yes, durable log |
+| `rtt` | text JSON `rtt.records` / `rtt.raw` | ignored / control only | Many read-only | Yes, durable log |
 | `dap` | raw payload | raw payload | Exactly one | No |
 
-- `serial` and `rtt` frames carry a sequence number so the CLI can strip it and
-  use it for resume.
-- RTT payloads stay raw. The server does not decode defmt; each subscriber
-  supplies its own ELF and keeps its current decoder and formatting behavior.
-  This is exactly what makes "follow the debug logs" useful: several clients can
-  decode the same RTT byte stream independently.
+- `serial` frames carry a sequence number. RTT data uses structured text frames
+  (`rtt.records` / `rtt.raw`) with the same sequence and channel fields, as
+  described in [rtt-artifact-decoding-design.md](rtt-artifact-decoding-design.md).
+- The server decodes defmt when an RTT session has a recorded artifact. The
+  artifact supplies the `_SEGGER_RTT` address and the defmt table; subscribers
+  no longer need a matching ELF. Sessions without an artifact stream raw bytes
+  and use the existing `probe-rs` RTT scan.
 - `dap` is a raw byte stream because the DAP protocol has its own framing; it
   cannot tolerate an inserted header. DAP is single-subscriber and closes on
   detach.
-- Text frames are JSON control messages, not data: `{"type":"pause"}`,
-  `{"type":"resume"}`, `{"type":"ping"}`, `{"type":"pong"}`.
+- Text frames are JSON. RTT data uses `rtt.records` and `rtt.raw`; control
+  messages use `{"type":"pause"}`, `{"type":"resume"}`, `{"type":"ping"}`, and
+  `{"type":"pong"}`.
 - The server enforces a maximum binary message size (64 KiB) and writes larger
   serial/RTT payloads as multiple chunks.
 - The ring is byte-bounded (defaults: serial 256 KiB, RTT 1 MiB, DAP none) and
@@ -1517,9 +1520,12 @@ The surface is resource-scoped:
 | `DELETE` | `/v1/sessions/{id}/subscribers/{subscriber_id}` | control | kick one follower |
 | `GET` | `/v1/sessions/{id}/io` | control | WebSocket data plane; multiple subscribers; any control subscriber may write |
 | `GET` | `/v1/sessions/{id}/export` | control | derived export; `format=asciicast-v3` |
+| `PUT` | `/v1/sessions/{id}/artifact` | control | set/replace the RTT decoder artifact |
+| `DELETE` | `/v1/sessions/{id}/artifact` | control | clear the RTT decoder artifact |
+| `DELETE` | `/v1/probes/{id}/artifact` | control | forget the probe's last-flashed artifact |
 | `POST` | `/v1/artifacts` | control | streamed upload; `201` + `Location` |
-| `GET` | `/v1/artifacts/{id}` | control | metadata; owner/admin |
-| `DELETE` | `/v1/artifacts/{id}` | control | owner/admin |
+| `GET` | `/v1/artifacts/{id}` | control | metadata and `in_use` |
+| `DELETE` | `/v1/artifacts/{id}` | control | explicit delete; `409` while referenced |
 | `GET` | `/v1/tokens` | admin | unchanged semantics |
 | `POST` | `/v1/tokens` | admin | unchanged semantics |
 | `DELETE` | `/v1/tokens/{selector}` | admin | unchanged semantics |
@@ -1544,7 +1550,7 @@ Content-Type: application/octet-stream
 HTTP/1.1 201 Created
 Location: /v1/artifacts/art_01J9Z6...
 
-{"id":"art_01J9Z6...","size":49152,"sha256":"...","expires_at":"2026-11-06T13:00:00.000Z"}
+{"id":"art_01J9Z6...","size":49152,"sha256":"...","in_use":false}
 ```
 
 ```http
@@ -1656,7 +1662,7 @@ The initial shape:
 | `not_asciicast_compatible` | 409 | Stream is binary or not valid UTF-8 for asciicast export |
 | `session_active` | 409 | Data purge requires the session to be closed/suspended |
 | `write_forbidden` | WS error | Read-only subscriber attempted a serial write |
-| `artifact_expired` | 410 | Artifact TTL elapsed |
+| `artifact_in_use` | 409 | Artifact is referenced by a session, probe record, or in-flight change |
 | `draining` | 503 | Server is shutting down |
 | `runtime_busy` | 503 | Control mailbox timeout |
 | `degraded` | 503 | Required runtime component is unavailable |
@@ -1740,7 +1746,7 @@ Execution errors are returned inside the change:
 | Session metadata | `boot.sqlite3` | Yes | Kind, resource, options, state, sequence bounds |
 | Session data | Append-only segment files | Yes | Replayable until retention/purge |
 | Change history | `boot.sqlite3` | Yes | Audit/inspection; execution is not resumed |
-| Artifacts | Spool files + metadata in `boot.sqlite3` | TTL | Existing design |
+| Artifacts | Spool files + metadata in `boot.sqlite3` | Yes | Until explicit delete; references guard in-use deletes |
 | Resources | In-memory | Rebuilt | Inventory watcher |
 | Leases | In-memory | No | Reacquired during recovery |
 | Subscribers/cursors | In-memory | No | Clients reconnect with `after` |
@@ -2048,8 +2054,8 @@ CREATE INDEX changes_by_status ON changes(status, updated_at);
 - `GET /v1/changes/{id}/follow` can serve a terminal change from the store after
   restart: send the snapshot and close.
 - No automatic retry. A user can submit a new flash change.
-- Artifacts remain TTL-based; change history does not pin them forever. A past
-  change may reference an expired artifact; this is visible in its metadata.
+- Artifacts persist until explicitly deleted. A past change may reference an
+  artifact that was later deleted; this is visible in its metadata.
 
 Why not resume execution:
 
@@ -2398,7 +2404,7 @@ measurement.
 | Q2 | Do we need a general server event stream? | Decided: defer indefinitely. Per-change follow plus session `/io` covers the CLI. |
 | Q3 | Should a revoked token's running change continue? | Decided: cancel at the next safe point. Queued changes are cancelled; a running driver call may finish before the change reaches `cancelled`. |
 | Q4 | Should sessions survive a server restart? | Decided: yes for serial/RTT when the resource is still present. DAP fails and has metadata only. The target is never reset automatically. |
-| Q5 | Should artifacts be one-shot or TTL-retained? | Decided: TTL-retained (1 hour default) with explicit delete. |
+| Q5 | Should artifacts be one-shot, TTL-retained, or persistent? | Decided: persistent until explicit delete; references prevent deleting an artifact that a session, probe record, or in-flight change still uses. |
 | Q6 | Should other principals be able to attach to a session? | Decided: any `control` principal can attach; `read` can only list metadata. No per-session sharing flag. |
 | Q7 | How should change-follow updates be shaped? | Decided: send `change.updated` and `task.updated` individually as they happen, with a full snapshot in `hello` and replay after a gap. |
 | Q8 | Should DAP auto-reconnect? | Decided: no. DAP is single-subscriber; close and recreate. |

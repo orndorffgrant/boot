@@ -17,6 +17,7 @@ pub const RECORD_INPUT: u8 = 1;
 pub const RECORD_GAP: u8 = 2;
 #[allow(dead_code)]
 pub const RECORD_LIFECYCLE: u8 = 3;
+pub const RECORD_DECODED: u8 = 4;
 
 const MAGIC: &[u8; 4] = b"BLOG";
 const VERSION: u8 = 1;

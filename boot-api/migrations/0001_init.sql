@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     data_bytes               INTEGER NOT NULL DEFAULT 0,
     replayable               INTEGER NOT NULL DEFAULT 1,
     resume_count             INTEGER NOT NULL DEFAULT 0,
+    artifact_id              TEXT,
+    decode_json              TEXT NOT NULL DEFAULT '{}',
     last_error               TEXT,
     CHECK (kind IN ('serial','rtt','dap')),
     CHECK (state IN ('creating','starting','active','suspended','resuming','closing','closed','failed'))
@@ -82,8 +84,29 @@ CREATE TABLE IF NOT EXISTS artifacts (
     path        TEXT NOT NULL,
     size        INTEGER NOT NULL,
     sha256      TEXT NOT NULL,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS artifacts_by_expiry ON artifacts(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_refs (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    owner_kind  TEXT NOT NULL CHECK (owner_kind IN ('session','change')),
+    owner_id    TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (artifact_id, owner_kind, owner_id)
+);
+
+CREATE INDEX IF NOT EXISTS artifact_refs_by_artifact ON artifact_refs(artifact_id);
+
+CREATE TABLE IF NOT EXISTS probe_artifacts (
+    resource_id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    sha256      TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    defmt       INTEGER NOT NULL DEFAULT 0,
+    rtt_addr    TEXT,
+    change_id   TEXT,
+    created_by  TEXT,
+    flashed_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS probe_artifacts_by_artifact ON probe_artifacts(artifact_id);

@@ -7,7 +7,19 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth::{api_client, api_client_with_timeout, map_error};
-use crate::cli_db::CliDb;
+use crate::cli_db::{CliDb, ServerEntry};
+
+fn map_probe_error(
+    server: &ServerEntry,
+    status: Option<reqwest::StatusCode>,
+    error: &dyn std::fmt::Display,
+) -> anyhow::Error {
+    match status {
+        Some(reqwest::StatusCode::NOT_FOUND) => anyhow::anyhow!("Not found: {}", error),
+        Some(reqwest::StatusCode::CONFLICT) => anyhow::anyhow!("Conflict: {}", error),
+        _ => map_error(server, status, error),
+    }
+}
 
 #[derive(Args)]
 pub struct RunFirmwareArgs {
@@ -27,9 +39,15 @@ pub struct RunFirmwareArgs {
 pub struct AttachProbeArgs {
     /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
     pub server_and_selector: String,
-    /// Optional path to the ELF file for defmt decoding
-    #[arg(long)]
+    /// Upload this ELF and use it for RTT address lookup and defmt decoding
+    #[arg(long, conflicts_with_all = ["artifact", "clear_artifact"])]
     pub elf: Option<String>,
+    /// Use an existing artifact for RTT address lookup and defmt decoding
+    #[arg(long, conflicts_with_all = ["elf", "clear_artifact"])]
+    pub artifact: Option<String>,
+    /// Clear the session decoder, or opt out of the inherited probe artifact
+    #[arg(long, conflicts_with_all = ["elf", "artifact"])]
+    pub clear_artifact: bool,
     /// Attach to an existing session only
     #[arg(long, conflicts_with = "new")]
     pub follow: bool,
@@ -85,11 +103,28 @@ pub async fn list_probes(cli_db: Option<&std::path::Path>) -> Result<()> {
                         probe.product_id,
                         probe.serial_number.as_deref().unwrap_or_default()
                     );
-                    table.add_row(vec![&server.name, &probe.id, &selector, &probe.name]);
+                    let firmware = probe
+                        .last_artifact
+                        .as_ref()
+                        .map(|artifact| {
+                            format!(
+                                "{}... ({})",
+                                artifact.id.chars().take(12).collect::<String>(),
+                                if artifact.defmt { "defmt" } else { "raw" }
+                            )
+                        })
+                        .unwrap_or_default();
+                    table.add_row(vec![
+                        &server.name,
+                        &probe.id,
+                        &selector,
+                        &probe.name,
+                        &firmware,
+                    ]);
                 }
             }
             Err(error) => {
-                let error = map_error(&server, error.status(), &format_args!("{error:#}"));
+                let error = map_probe_error(&server, error.status(), &format_args!("{error:#}"));
                 eprintln!(
                     "Error connecting to server '{}' ({}): {}",
                     server.name, server.url, error
@@ -100,19 +135,6 @@ pub async fn list_probes(cli_db: Option<&std::path::Path>) -> Result<()> {
 
     println!("{table}");
     Ok(())
-}
-
-fn extract_rtt_address(elf_bytes: &[u8]) -> Option<u64> {
-    use object::{Object, ObjectSymbol};
-    let elf_file = object::File::parse(elf_bytes).ok()?;
-    for symbol in elf_file.symbols() {
-        if let Ok(name) = symbol.name() {
-            if name == "_SEGGER_RTT" {
-                return Some(symbol.address());
-            }
-        }
-    }
-    None
 }
 
 async fn upgraded_to_websocket(
@@ -165,6 +187,58 @@ async fn find_active_session(
         .find(|session| session.resource_id == resource_id && session.kind == kind))
 }
 
+async fn upload_artifact(
+    client: &boot_api_client::Client,
+    server: &crate::cli_db::ServerEntry,
+    path: &str,
+) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("Failed to read ELF file '{}': {}", path, error))?;
+    let artifact = client
+        .create_artifact(bytes)
+        .await
+        .map_err(|error| map_probe_error(server, error.status(), &format_args!("{error:#}")))?
+        .into_inner();
+    Ok(artifact.id)
+}
+
+fn decoder_label_fields(mode: &str, artifact: Option<(&str, &str)>) -> String {
+    match artifact {
+        Some((id, sha256)) if mode == "defmt" => format!(
+            "defmt ({}..., sha256 {})",
+            id.chars().take(12).collect::<String>(),
+            sha256.chars().take(12).collect::<String>()
+        ),
+        Some((id, _)) => format!(
+            "raw ({}..., no defmt table)",
+            id.chars().take(12).collect::<String>()
+        ),
+        None => "raw (no artifact)".to_string(),
+    }
+}
+
+fn decoder_label(session: &boot_api_client::types::Session) -> String {
+    decoder_label_fields(
+        &session.decode.mode,
+        session
+            .decode
+            .artifact
+            .as_ref()
+            .map(|artifact| (artifact.id.as_str(), artifact.sha256.as_str())),
+    )
+}
+
+fn decoder_label_protocol(session: &boot_protocol::Session) -> String {
+    decoder_label_fields(
+        &session.decode.mode,
+        session
+            .decode
+            .artifact
+            .as_ref()
+            .map(|artifact| (artifact.id.as_str(), artifact.sha256.as_str())),
+    )
+}
+
 pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
     let (server_name, selector) = split_server_resource(&args.server_and_selector)?;
     let config = CliDb::open_default(cli_db).await?;
@@ -197,7 +271,7 @@ pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path
         .await
         .map_err(|error| {
             spinner.finish_and_clear();
-            map_error(&server, error.status(), &format_args!("{error:#}"))
+            map_probe_error(&server, error.status(), &format_args!("{error:#}"))
         })?
         .into_inner();
 
@@ -216,7 +290,7 @@ pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path
         .await
         .map_err(|error| {
             spinner.finish_and_clear();
-            map_error(&server, error.status(), &format_args!("{error:#}"))
+            map_probe_error(&server, error.status(), &format_args!("{error:#}"))
         })?
         .into_inner();
 
@@ -225,7 +299,7 @@ pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path
         .await
         .map_err(|error| {
             spinner.finish_and_clear();
-            map_error(&server, error.status(), &format_args!("{error:#}"))
+            map_probe_error(&server, error.status(), &format_args!("{error:#}"))
         })?
         .into_inner();
     let ws_stream = upgraded_to_websocket(upgraded).await;
@@ -282,7 +356,9 @@ pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path
         attach_probe(
             AttachProbeArgs {
                 server_and_selector: args.server_and_selector,
-                elf: Some(args.elf_path),
+                elf: None,
+                artifact: None,
+                clear_artifact: false,
                 follow: false,
                 new: true,
                 read_only: false,
@@ -297,70 +373,101 @@ pub async fn run_firmware(args: RunFirmwareArgs, cli_db: Option<&std::path::Path
 }
 
 pub async fn attach_probe(args: AttachProbeArgs, cli_db: Option<&std::path::Path>) -> Result<()> {
-    use defmt_decoder::Table as DefmtTable;
-
     let (server_name, selector) = split_server_resource(&args.server_and_selector)?;
     let config = CliDb::open_default(cli_db).await?;
     let server = config
         .get_server(server_name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+    let client = api_client(&server)?;
+    let probe_id = resolve_probe_id(&client, selector).await?;
 
-    let defmt_table = if let Some(elf_path) = &args.elf {
-        let elf_bytes = std::fs::read(elf_path).map_err(|error| {
-            anyhow::anyhow!("Failed to read ELF file '{}': {}", elf_path, error)
-        })?;
-        let table = DefmtTable::parse(&elf_bytes)?
-            .ok_or_else(|| anyhow::anyhow!("No defmt data found in ELF file"))?;
-        Some((table, elf_bytes))
+    let uploaded_artifact = if let Some(path) = &args.elf {
+        Some(upload_artifact(&client, &server, path).await?)
     } else {
         None
     };
-    let mut defmt_decoder = defmt_table
-        .as_ref()
-        .map(|(table, _)| table.new_stream_decoder());
-    let defmt_locations = defmt_table
-        .as_ref()
-        .and_then(|(table, elf_bytes)| table.get_locations(elf_bytes).ok());
+    let requested_artifact = uploaded_artifact.or_else(|| args.artifact.clone());
 
-    let client = api_client(&server)?;
-    let probe_id = resolve_probe_id(&client, selector).await?;
-    let session_id = if let Some(session) = &args.session {
-        session.clone()
+    let session_id = if let Some(session_id) = &args.session {
+        if args.clear_artifact {
+            client
+                .delete_session_artifact(session_id)
+                .await
+                .map_err(|error| {
+                    map_probe_error(&server, error.status(), &format_args!("{error:#}"))
+                })?;
+        } else if let Some(artifact) = &requested_artifact {
+            client
+                .set_session_artifact(
+                    session_id,
+                    &boot_api_client::types::SetArtifactRequest {
+                        artifact: artifact.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    map_probe_error(&server, error.status(), &format_args!("{error:#}"))
+                })?;
+        }
+        session_id.clone()
     } else if let Some(existing) = find_active_session(&client, &probe_id, "rtt").await? {
         if args.new {
             anyhow::bail!("Probe already has an active session: {}", existing.id);
+        }
+        if args.clear_artifact {
+            client
+                .delete_session_artifact(&existing.id)
+                .await
+                .map_err(|error| {
+                    map_probe_error(&server, error.status(), &format_args!("{error:#}"))
+                })?;
+        } else if let Some(artifact) = &requested_artifact {
+            client
+                .set_session_artifact(
+                    &existing.id,
+                    &boot_api_client::types::SetArtifactRequest {
+                        artifact: artifact.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    map_probe_error(&server, error.status(), &format_args!("{error:#}"))
+                })?;
         }
         existing.id
     } else {
         if args.follow {
             anyhow::bail!("No active RTT session for probe '{}'", selector);
         }
-        let rtt_addr = defmt_table
-            .as_ref()
-            .and_then(|(_, elf_bytes)| extract_rtt_address(elf_bytes))
-            .map(|address| format!("0x{address:x}"));
         client
             .create_probe_session(
                 &probe_id,
                 &boot_api_client::types::ProbeSessionRequest {
                     kind: "rtt".to_string(),
                     options: boot_api_client::types::SessionOptions {
-                        rtt_addr,
+                        rtt_addr: None,
                         channels: Vec::new(),
                         baud_rate: None,
                     },
+                    artifact: requested_artifact.clone(),
+                    inherit_artifact: !args.clear_artifact,
                     max_subscribers: 8,
                     detach_timeout_seconds: 60,
                     wait_ms: 5000,
                 },
             )
             .await
-            .map_err(|error| map_error(&server, error.status(), &format_args!("{error:#}")))?
+            .map_err(|error| map_probe_error(&server, error.status(), &format_args!("{error:#}")))?
             .into_inner()
             .id
     };
 
+    let session = client
+        .get_session(&session_id)
+        .await
+        .map_err(|error| map_probe_error(&server, error.status(), &format_args!("{error:#}")))?
+        .into_inner();
     println!("Attaching to {}...", session_id);
     let upgraded = client
         .session_io(
@@ -371,15 +478,16 @@ pub async fn attach_probe(args: AttachProbeArgs, cli_db: Option<&std::path::Path
             None,
         )
         .await
-        .map_err(|error| map_error(&server, error.status(), &format_args!("{error:#}")))?
+        .map_err(|error| map_probe_error(&server, error.status(), &format_args!("{error:#}")))?
         .into_inner();
     let ws_stream = upgraded_to_websocket(upgraded).await;
     let (_ws_tx, mut ws_rx) = ws_stream.split();
 
-    let encoding = if args.elf.is_some() { "defmt" } else { "UTF-8" };
     println!(
-        "✓ Attached to {}/{} RTT ({})",
-        server_name, selector, encoding
+        "✓ Attached to {}/{} RTT\n  decoder: {}",
+        server_name,
+        selector,
+        decoder_label(&session)
     );
     println!();
 
@@ -387,83 +495,32 @@ pub async fn attach_probe(args: AttachProbeArgs, cli_db: Option<&std::path::Path
     let mut stdout = stdout();
     while let Some(message) = ws_rx.next().await {
         match message? {
-            Message::Binary(data) => {
-                let data = if data.len() >= 9 {
-                    &data[9..]
-                } else {
-                    continue;
-                };
-                if let Some(stream_decoder) = &mut defmt_decoder {
-                    stream_decoder.received(data);
-                    loop {
-                        match stream_decoder.decode() {
-                            Ok(frame) => {
-                                let (file, line, module) = defmt_locations
-                                    .as_ref()
-                                    .and_then(|locations| locations.get(&frame.index()))
-                                    .map(|location| {
-                                        (
-                                            location.file.display().to_string(),
-                                            location.line as u32,
-                                            location.module.clone(),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| ("unknown".into(), 0, String::new()));
-                                let timestamp = frame
-                                    .display_timestamp()
-                                    .map(|timestamp| format!("{timestamp} "))
-                                    .unwrap_or_default();
-                                let level = match frame.level() {
-                                    Some(defmt_parser::Level::Trace) => "TRACE",
-                                    Some(defmt_parser::Level::Debug) => "DEBUG",
-                                    Some(defmt_parser::Level::Info) => "INFO",
-                                    Some(defmt_parser::Level::Warn) => "WARN",
-                                    Some(defmt_parser::Level::Error) => "ERROR",
-                                    None => "",
-                                };
-                                let output = if !module.is_empty() {
-                                    format!(
-                                        "{}{} {}:{} > {}\n",
-                                        timestamp,
-                                        level,
-                                        module,
-                                        line,
-                                        frame.display_message()
-                                    )
-                                } else {
-                                    format!(
-                                        "{}{} {}:{} > {}\n",
-                                        timestamp,
-                                        level,
-                                        file,
-                                        line,
-                                        frame.display_message()
-                                    )
-                                };
-                                stdout.write_all(output.as_bytes()).await?;
-                                stdout.flush().await?;
-                            }
-                            Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
-                            Err(defmt_decoder::DecodeError::Malformed) => {
-                                eprintln!("Warning: malformed defmt frame");
-                                break;
-                            }
-                        }
+            Message::Text(text) => match serde_json::from_str::<SessionWsMessage>(&text) {
+                Ok(SessionWsMessage::RttRecords { records, .. }) => {
+                    for record in records {
+                        stdout.write_all(record.display_line().as_bytes()).await?;
                     }
-                } else {
-                    stdout
-                        .write_all(&String::from_utf8_lossy(data).into_owned().into_bytes())
-                        .await?;
                     stdout.flush().await?;
                 }
-            }
-            Message::Text(text) => {
-                if let Ok(SessionWsMessage::Error { message, .. }) =
-                    serde_json::from_str::<SessionWsMessage>(&text)
-                {
-                    eprintln!("{}", message);
+                Ok(SessionWsMessage::RttRaw { data, .. }) => {
+                    use base64::Engine;
+                    if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
+                        stdout
+                            .write_all(&String::from_utf8_lossy(&bytes).into_owned().into_bytes())
+                            .await?;
+                        stdout.flush().await?;
+                    }
                 }
-            }
+                Ok(SessionWsMessage::RttDecodeError { message, .. }) => {
+                    eprintln!("decoder: {message}");
+                }
+                Ok(SessionWsMessage::DecoderChanged { session }) => {
+                    println!("\nDecoder changed: {}", decoder_label_protocol(&session));
+                }
+                Ok(SessionWsMessage::Error { message, .. }) => eprintln!("{}", message),
+                _ => {}
+            },
+            Message::Binary(_) => {}
             Message::Close(_) => break,
             _ => {}
         }

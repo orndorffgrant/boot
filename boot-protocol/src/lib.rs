@@ -21,6 +21,20 @@ pub struct Probe {
     pub generation: u64,
     pub state: String,
     pub identity_stable: bool,
+    /// Last artifact successfully flashed through boot for this probe.
+    pub last_artifact: Option<ProbeArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProbeArtifact {
+    pub id: String,
+    pub size: u64,
+    pub sha256: String,
+    pub flashed_at: String,
+    pub change: Option<String>,
+    pub created_by: Option<String>,
+    pub defmt: bool,
+    pub rtt_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -160,6 +174,13 @@ pub struct ProbeSessionRequest {
     pub kind: String,
     #[serde(default)]
     pub options: SessionOptions,
+    /// Firmware artifact to use for RTT address lookup and defmt decoding.
+    /// Overrides the probe's last flashed artifact.
+    #[serde(default)]
+    pub artifact: Option<String>,
+    /// Inherit the probe's last flashed artifact when `artifact` is absent.
+    #[serde(default = "default_true")]
+    pub inherit_artifact: bool,
     #[serde(default = "default_max_subscribers")]
     pub max_subscribers: u32,
     #[serde(default = "default_detach_timeout")]
@@ -199,6 +220,40 @@ pub struct SessionData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionArtifact {
+    pub id: String,
+    pub size: u64,
+    pub sha256: String,
+    pub created_at: String,
+    pub defmt: bool,
+    pub rtt_addr: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionDecode {
+    /// `defmt` or `raw`.
+    pub mode: String,
+    pub epoch: u64,
+    pub artifact: Option<SessionArtifact>,
+    /// RTT control block address actually used by the producer.
+    pub rtt_addr: Option<String>,
+    /// `explicit`, `artifact`, or `scan`.
+    pub rtt_addr_source: String,
+}
+
+impl Default for SessionDecode {
+    fn default() -> Self {
+        Self {
+            mode: "raw".to_string(),
+            epoch: 0,
+            artifact: None,
+            rtt_addr: None,
+            rtt_addr_source: "scan".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Session {
     pub id: String,
     pub kind: String,
@@ -214,6 +269,7 @@ pub struct Session {
     pub resume_count: u64,
     pub replayable: bool,
     pub data: SessionData,
+    pub decode: SessionDecode,
     pub last_error: Option<String>,
 }
 
@@ -233,7 +289,9 @@ pub struct Artifact {
     pub size: u64,
     pub sha256: String,
     pub created_at: String,
-    pub expires_at: String,
+    /// Whether deleting this artifact would conflict with a session, probe
+    /// last-flash record, or in-flight change.
+    pub in_use: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -284,6 +342,43 @@ pub enum ChangeWsMessage {
     ChangeCompleted { v: u8, seq: u64, change: Change },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RttRecord {
+    /// Defmt timestamp rendering, when the table has timestamp data.
+    pub timestamp: Option<String>,
+    /// Lowercase level: trace, debug, info, warn, error.
+    pub level: Option<String>,
+    pub module: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub message: String,
+}
+
+impl RttRecord {
+    /// Render one record in the same shape the CLI has historically printed.
+    pub fn display_line(&self) -> String {
+        let level = self
+            .level
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_default();
+        let location =
+            if let Some(module) = self.module.as_deref().filter(|value| !value.is_empty()) {
+                format!("{module}:{}", self.line.unwrap_or(0))
+            } else if let Some(file) = self.file.as_deref() {
+                format!("{file}:{}", self.line.unwrap_or(0))
+            } else {
+                "unknown:0".to_string()
+            };
+        let timestamp = self
+            .timestamp
+            .as_deref()
+            .map(|value| format!("{value} "))
+            .unwrap_or_default();
+        format!("{timestamp}{level} {location} > {}\n", self.message)
+    }
+}
+
 /// Text control messages for a session data WebSocket. Binary frames are data.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type")]
@@ -319,6 +414,30 @@ pub enum SessionWsMessage {
     },
     #[serde(rename = "session.input")]
     Input { seq: u64, data: String },
+    #[serde(rename = "rtt.records")]
+    RttRecords {
+        seq: u64,
+        channel: u8,
+        epoch: u64,
+        records: Vec<RttRecord>,
+    },
+    #[serde(rename = "rtt.raw")]
+    RttRaw {
+        seq: u64,
+        channel: u8,
+        epoch: u64,
+        /// Base64; the bytes are not necessarily UTF-8.
+        data: String,
+    },
+    #[serde(rename = "rtt.decode_error")]
+    RttDecodeError {
+        seq: u64,
+        channel: u8,
+        epoch: u64,
+        message: String,
+    },
+    #[serde(rename = "session.decoder")]
+    DecoderChanged { session: Session },
     #[serde(rename = "error")]
     Error { code: String, message: String },
     #[serde(rename = "ping")]
@@ -337,4 +456,52 @@ pub struct ApiErrorBody {
     pub holder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtt_record_messages_round_trip() {
+        let message = SessionWsMessage::RttRecords {
+            seq: 7,
+            channel: 0,
+            epoch: 2,
+            records: vec![RttRecord {
+                timestamp: Some("1.5".into()),
+                level: Some("info".into()),
+                module: Some("app".into()),
+                file: Some("src/main.rs".into()),
+                line: Some(7),
+                message: "ready".into(),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"rtt.records\""));
+        assert_eq!(
+            serde_json::from_str::<SessionWsMessage>(&json).unwrap(),
+            message
+        );
+
+        let raw = SessionWsMessage::RttRaw {
+            seq: 8,
+            channel: 1,
+            epoch: 0,
+            data: "aGk=".into(),
+        };
+        let json = serde_json::to_string(&raw).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionWsMessage>(&json).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn session_decode_defaults_to_raw() {
+        let decode = SessionDecode::default();
+        assert_eq!(decode.mode, "raw");
+        assert_eq!(decode.epoch, 0);
+        assert!(decode.artifact.is_none());
+    }
 }

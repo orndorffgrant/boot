@@ -13,13 +13,10 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
-defmt-decoder.workspace = true
-defmt-parser.workspace = true
 directories.workspace = true
 futures.workspace = true
 hyper-util.workspace = true
 indicatif.workspace = true
-object.workspace = true
 boot-api = { workspace = true, features = ["run"] }
 boot-api-client.workspace = true
 boot-protocol.workspace = true

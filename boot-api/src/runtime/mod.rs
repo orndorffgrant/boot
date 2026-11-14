@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod change;
+pub mod decode;
 pub mod inventory;
 pub mod lease;
 pub mod session;
@@ -14,10 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use boot_protocol::ProbeArtifact;
 use sha2::{Digest, Sha256};
 
 use crate::auth::StoreError;
-use crate::store::Store;
+use crate::store::{RuntimeStore, Store};
 
 pub use change::ChangeHandle;
 pub use inventory::{ResourceEntry, ResourceKind};
@@ -106,6 +108,8 @@ pub struct RuntimeInner {
     pub leases: Mutex<HashMap<String, lease::LeaseEntry>>,
     pub changes: Mutex<HashMap<String, Arc<ChangeHandle>>>,
     pub sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    pub probe_artifacts: Mutex<HashMap<String, ProbeArtifact>>,
+    pub decode_cache: Mutex<HashMap<String, Arc<decode::DecodeProfile>>>,
     pub generation: AtomicU64,
 }
 
@@ -125,6 +129,8 @@ impl Runtime {
                 leases: Mutex::new(HashMap::new()),
                 changes: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
+                probe_artifacts: Mutex::new(HashMap::new()),
+                decode_cache: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(1),
             }),
         }
@@ -133,8 +139,21 @@ impl Runtime {
     pub async fn start(&self) -> Result<()> {
         inventory::refresh(&self.inner).await?;
         change::restore(&self.inner).await?;
+        artifact::restore_probe_artifacts(&self.inner).await?;
+        self.inner
+            .store
+            .remove_artifact_refs_for_owner_kind("change")
+            .await?;
         Self::restore_sessions(&self.inner).await?;
-        let _ = artifact::cleanup(&self.inner).await;
+        for session in self.sessions_list() {
+            if matches!(session.state.as_str(), "closed" | "failed") {
+                let _ = self
+                    .inner
+                    .store
+                    .remove_artifact_refs_for_owner("session", &session.id)
+                    .await;
+            }
+        }
         let suspended: Vec<_> = self
             .sessions_list()
             .into_iter()
@@ -146,17 +165,10 @@ impl Runtime {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(inner.config.inventory_interval);
-            let mut cleanup = tokio::time::interval(Duration::from_secs(300));
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(error) = inventory::refresh(&inner).await {
-                            eprintln!("inventory refresh failed: {error:#}");
-                        }
-                    }
-                    _ = cleanup.tick() => {
-                        let _ = artifact::cleanup(&inner).await;
-                    }
+                interval.tick().await;
+                if let Err(error) = inventory::refresh(&inner).await {
+                    eprintln!("inventory refresh failed: {error:#}");
                 }
             }
         });
@@ -183,6 +195,14 @@ impl Runtime {
             .expect("resources lock")
             .get(id)
             .cloned()
+    }
+
+    pub fn probe_artifact(&self, resource_id: &str) -> Option<ProbeArtifact> {
+        artifact::probe_artifact(&self.inner, resource_id)
+    }
+
+    pub async fn clear_probe_artifact(&self, resource_id: &str) -> Result<(), RuntimeError> {
+        artifact::clear_probe_artifact(&self.inner, resource_id).await
     }
 }
 

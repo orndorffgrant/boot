@@ -162,10 +162,15 @@ impl Runtime {
                 serde_json::json!({"artifact": artifact_id}),
             )
             .await?;
+        self.inner
+            .store
+            .add_artifact_ref(artifact_id, "change", &change.id, now_unix())
+            .await?;
         let handle = self.change_handle(&change.id)?;
         let inner = self.inner.clone();
+        let artifact_id = artifact_id.to_string();
         tokio::spawn(async move {
-            run_flash(inner, handle, path, options).await;
+            run_flash(inner, handle, path, artifact_id, options).await;
         });
         Ok(change)
     }
@@ -299,6 +304,7 @@ async fn run_flash(
     inner: Arc<RuntimeInner>,
     handle: Arc<ChangeHandle>,
     path: std::path::PathBuf,
+    artifact_id: String,
     options: FlashOptions,
 ) {
     let _lease = match lease::acquire(
@@ -355,6 +361,9 @@ async fn run_flash(
                 cancel(&inner, &handle).await;
                 return;
             }
+            // The hardware write is complete; let a post-flash attach acquire
+            // the probe while the change finishes its bookkeeping.
+            drop(_lease);
             let mut task = task;
             task.status = "done".to_string();
             task.progress = Some(Progress {
@@ -371,8 +380,30 @@ async fn run_flash(
             change.ready = true;
             change.ready_time = Some(now_rfc3339());
             change.tasks = vec![task];
+            match artifact::set_probe_artifact(
+                &inner,
+                &handle.resource_id,
+                &artifact_id,
+                Some(&handle.id),
+                Some(&handle.created_by),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!(
+                        "flash {} succeeded but probe artifact was not recorded: {}",
+                        handle.id, error
+                    );
+                    let _ = artifact::clear_probe_artifact(&inner, &handle.resource_id).await;
+                }
+            }
             handle.publish_change(change.clone(), true);
             let _ = persist_change(&inner, &change).await;
+            let _ = inner
+                .store
+                .remove_artifact_ref(&artifact_id, "change", &handle.id)
+                .await;
         }
         Err(error) => fail(&inner, &handle, "flash_failed", error).await,
     }
@@ -504,6 +535,10 @@ async fn fail(inner: &Arc<RuntimeInner>, handle: &Arc<ChangeHandle>, code: &str,
     });
     handle.publish_change(change.clone(), true);
     let _ = persist_change(inner, &change).await;
+    let _ = inner
+        .store
+        .remove_artifact_refs_for_owner("change", &handle.id)
+        .await;
 }
 
 async fn cancel(inner: &Arc<RuntimeInner>, handle: &Arc<ChangeHandle>) {
@@ -513,6 +548,10 @@ async fn cancel(inner: &Arc<RuntimeInner>, handle: &Arc<ChangeHandle>) {
     change.ready_time = Some(now_rfc3339());
     handle.publish_change(change.clone(), true);
     let _ = persist_change(inner, &change).await;
+    let _ = inner
+        .store
+        .remove_artifact_refs_for_owner("change", &handle.id)
+        .await;
 }
 
 pub async fn restore(inner: &Arc<RuntimeInner>) -> Result<()> {
