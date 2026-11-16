@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! SQLite storage for CLI state: known servers and their plaintext tokens.
 
 use std::fs::{self, OpenOptions};

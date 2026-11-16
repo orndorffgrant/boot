@@ -500,6 +500,9 @@ Endpoint policy:
 | Endpoint | Scope |
 | --- | --- |
 | `GET /v1/health` | public |
+| `GET /v1/source` | public |
+| `GET /v1/source/dependencies` | public |
+| `GET /v1/source/manifest` | public |
 | `GET /v1/probes` | `read` |
 | `GET /v1/serial-ports` | `read` |
 | `GET /v1/tokens` | `admin` |
@@ -516,6 +519,13 @@ Endpoint policy:
 Health is public so monitoring and `boot show-server` can test reachability without
 a token. It exposes only status, version, and the fact that auth is required. It does
 not expose probe, serial, or token information.
+
+The source endpoints are public because AGPLv3 section 13 requires the source
+offer to reach every user interacting with the server. `GET /v1/source` serves
+the first-party source archive embedded in the running binary,
+`GET /v1/source/dependencies` redirects to the dependency source bundle, and
+`GET /v1/source/manifest` describes that bundle. They must not be placed behind
+an auth proxy.
 
 ### Token administration API
 
@@ -873,7 +883,8 @@ In `openapi()`, post-process the JSON to add:
 ```
 
 Add `"security": [{"bootAuth": []}]` to every operation except `GET /v1/health`,
-which gets `"security": []`. Add `401`/`403` responses to protected operations,
+`GET /v1/source`, `GET /v1/source/dependencies`, and `GET /v1/source/manifest`,
+which get `"security": []`. Add `401`/`403` responses to protected operations,
 including all four `/v1/tokens` methods. The `Auth` extractor contributes no
 parameters.
 
@@ -1094,6 +1105,9 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
 ### Integration tests
 
 - `GET /v1/health` without a token → `200`.
+- `GET /v1/source` without a token → `200` with the embedded source tar.
+- `GET /v1/source/manifest` without a token → `200` with dependency metadata.
+- `GET /v1/source/dependencies` without a token → `302` when configured.
 - `GET /v1/probes` without a token → `401` with `WWW-Authenticate`.
 - `GET /v1/probes` with a read token → `200`.
 - `POST /v1/probes/{selector}` with a read token → `403` before touching hardware.
@@ -1110,7 +1124,8 @@ hashing, schema, and format. The CLI DB lives in `boot-cli`.
   `/v1/tokens`.
 - The server applies migrations on startup even with `--no-provision`, and
   `/v1/tokens` remains usable.
-- `openapi()` includes the bearer scheme on every path except `/v1/health`, and the
+- `openapi()` includes the bearer scheme on every path except `/v1/health`,
+  `/v1/source`, `/v1/source/dependencies`, and `/v1/source/manifest`, and the
   `/v1/tokens` operations declare `401`/`403`.
 - `cargo build -p boot-api-client` succeeds after the Dropshot 0.17 update and spec
   change, and the generated client still compiles with `api_client()`.

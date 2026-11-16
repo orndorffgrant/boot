@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use dropshot::HttpError;
 use dropshot::HttpResponseAccepted;
 use dropshot::HttpResponseCreated;
+use dropshot::HttpResponseFound;
 use dropshot::HttpResponseHeaders;
 use dropshot::HttpResponseOk;
 use dropshot::Path;
@@ -16,6 +18,8 @@ pub mod auth;
 
 #[cfg(feature = "run")]
 mod runtime;
+#[cfg(feature = "run")]
+pub mod source;
 #[cfg(feature = "run")]
 pub mod store;
 
@@ -162,6 +166,38 @@ trait BootApi {
     async fn health(
         rqctx: RequestContext<Self::Context>,
     ) -> Result<HttpResponseOk<ServerStatus>, HttpError>;
+
+    /// Download the corresponding source for this exact build.
+    ///
+    /// This endpoint is intentionally public: AGPLv3 section 13 requires the
+    /// source offer to reach every user interacting with the server.
+    #[endpoint {
+        method = GET,
+        path = "/v1/source",
+    }]
+    async fn source(
+        rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<dropshot::FreeformBody>>, HttpError>;
+
+    /// Redirect to the dependency source bundle for this exact build.
+    ///
+    /// This endpoint is public for the same reason as `GET /v1/source`.
+    #[endpoint {
+        method = GET,
+        path = "/v1/source/dependencies",
+    }]
+    async fn source_dependencies(
+        rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseFound, HttpError>;
+
+    /// Describe the dependency source bundle for this exact build.
+    #[endpoint {
+        method = GET,
+        path = "/v1/source/manifest",
+    }]
+    async fn source_manifest(
+        rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseOk<DependencySource>, HttpError>;
 
     #[endpoint {
         method = GET,
@@ -527,7 +563,10 @@ fn apply_security(document: &mut serde_json::Value) {
         let Some(operation) = item.as_object_mut() else {
             continue;
         };
-        let public = path == "/v1/health";
+        let public = matches!(
+            path.as_str(),
+            "/v1/health" | "/v1/source" | "/v1/source/dependencies" | "/v1/source/manifest"
+        );
         for method in ["get", "post", "put", "delete", "patch"] {
             let Some(operation) = operation
                 .get_mut(method)
@@ -588,6 +627,18 @@ mod tests {
         );
         assert_eq!(
             document["paths"]["/v1/health"]["get"]["security"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            document["paths"]["/v1/source"]["get"]["security"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            document["paths"]["/v1/source/dependencies"]["get"]["security"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            document["paths"]["/v1/source/manifest"]["get"]["security"],
             serde_json::json!([])
         );
         assert_eq!(

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Shared API database: token hashes plus runtime metadata.
 -- Plaintext tokens live only in the CLI database.
 CREATE TABLE IF NOT EXISTS tokens (

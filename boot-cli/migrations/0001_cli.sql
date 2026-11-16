@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- CLI database: known servers and their optional plaintext client tokens.
 CREATE TABLE IF NOT EXISTS servers (
     name       TEXT PRIMARY KEY,

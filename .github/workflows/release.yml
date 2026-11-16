@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 name: Release
 
 on:
@@ -71,6 +72,53 @@ jobs:
           git fetch --no-tags origin "$DEFAULT_BRANCH"
           git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"
 
+  source:
+    name: Source archive
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate source archive
+        run: tools/source-archive.sh --release --output target/source/boot-source.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-source
+          path: |
+            target/source/boot-source.tar
+            target/source/boot-source.meta
+            target/source/boot-source.tar.sha256
+          if-no-files-found: error
+
+  dependencies:
+    name: Dependency source
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate dependency source bundle
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          tools/dependency-source.sh \
+            --output "target/source/boot-${VERSION}-dependencies.tar.xz" \
+            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/boot-${VERSION}-dependencies.tar.xz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-dependencies
+          path: |
+            target/source/boot-*-dependencies.tar.xz
+            target/source/boot-*-dependencies.tar.xz.sha256
+            target/source/boot-dependencies.meta
+          if-no-files-found: error
+
   test:
     name: Test
     needs: validate
@@ -83,12 +131,19 @@ jobs:
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+
       - name: Run tests
         run: cargo test --workspace --locked
 
   build:
     name: Build ${{ matrix.target }}
-    needs: validate
+    needs: [validate, source, dependencies]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -103,13 +158,97 @@ jobs:
         with:
           tool: cross
 
+      - name: Download source archive
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-source
+          path: target/source
+
+      - name: Download dependency source
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-dependencies
+          path: target/source
+
+      - name: Verify source archives
+        run: |
+          sha256sum -c target/source/boot-source.tar.sha256
+          sha256sum -c target/source/boot-*-dependencies.tar.xz.sha256
+
       - name: Build release binary
+        env:
+          BOOT_DEPENDENCY_SOURCE_REQUIRED: "1"
+          BOOT_SOURCE_REQUIRED: "1"
         run: cross build --release --locked --target ${{ matrix.target }} -p boot-cli
+
+      - name: Verify embedded source hashes
+        run: |
+          source_sha=$(sha256sum target/source/boot-source.tar | awk '{print $1}')
+          dep_sha=$(sha256sum target/source/boot-*-dependencies.tar.xz | awk '{print $1}')
+          binary="target/${{ matrix.target }}/release/boot"
+          for expected in "$source_sha" "$dep_sha"; do
+            if ! grep -aq "$expected" "$binary"; then
+              echo "embedded source hash $expected is missing from $binary" >&2
+              exit 1
+            fi
+          done
 
       - name: Package binary and checksum
         run: |
           cp "target/${{ matrix.target }}/release/boot" "boot-${{ matrix.target }}"
           sha256sum "boot-${{ matrix.target }}" > "boot-${{ matrix.target }}.sha256"
+
+      - name: Verify embedded source archive
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          API_DB: ${{ runner.temp }}/boot-source-check.sqlite3
+          SERVER_LOG: ${{ runner.temp }}/boot-source-check.log
+          EMBEDDED_SOURCE: ${{ runner.temp }}/boot-embedded-source.tar
+          DEPENDENCY_MANIFEST: ${{ runner.temp }}/boot-dependency-manifest.json
+        run: |
+          set -euo pipefail
+          ./target/${{ matrix.target }}/release/boot --api-db "$API_DB" run-server \
+            --host 127.0.0.1 --port 46773 --no-provision \
+            >"$SERVER_LOG" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:46773/v1/health >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "boot server did not become ready" >&2
+            cat "$SERVER_LOG" >&2
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:46773/v1/source -o "$EMBEDDED_SOURCE"
+          cmp "$EMBEDDED_SOURCE" target/source/boot-source.tar
+          curl -fsS http://127.0.0.1:46773/v1/source/manifest -o "$DEPENDENCY_MANIFEST"
+          dep_url=$(awk -F= '/^url=/{print $2}' target/source/boot-dependencies.meta)
+          dep_sha=$(awk -F= '/^sha256=/{print $2}' target/source/boot-dependencies.meta)
+          python3 - "$DEPENDENCY_MANIFEST" "$dep_url" "$dep_sha" <<'PY'
+          import json
+          import sys
+
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert manifest["available"] is True
+          assert manifest["license"] == "AGPL-3.0-or-later"
+          assert manifest["url"] == sys.argv[2]
+          assert manifest["sha256"] == sys.argv[3]
+          assert manifest["filename"].endswith(".tar.xz")
+          assert manifest["packages"] > 0
+          assert len(manifest["targets"]) == 2
+          PY
+          location=$(curl -sS -D - -o /dev/null \
+            http://127.0.0.1:46773/v1/source/dependencies |
+            tr -d '\r' |
+            awk -F': ' 'tolower($1) == "location" {print $2}')
+          test "$location" = "$dep_url"
+          sha256sum "$EMBEDDED_SOURCE"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -121,7 +260,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [validate, build, test]
+    needs: [validate, build, test, source, dependencies]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -129,12 +268,35 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Package source asset
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cp dist/boot-source.tar "dist/boot-${VERSION}-source.tar"
+          sha256sum "dist/boot-${VERSION}-source.tar" > "dist/boot-${VERSION}-source.tar.sha256"
+          dep=$(ls dist/boot-*-dependencies.tar.xz)
+          sha256sum "$dep" > "$dep.sha256"
+          rm dist/boot-source.tar dist/boot-source.meta dist/boot-source.tar.sha256
+          rm dist/boot-dependencies.meta
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          body: |
+            ## License and source
+
+            This release is licensed under AGPL-3.0-or-later. The corresponding
+            first-party source is attached as
+            `boot-${{ needs.validate.outputs.version }}-source.tar` and is served
+            at public `GET /v1/source`.
+
+            Third-party dependency source is attached as
+            `boot-${{ needs.validate.outputs.version }}-dependencies.tar.xz` and
+            is offered at `GET /v1/source/dependencies`.
           generate_release_notes: true
           prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
           overwrite_files: true
+          fail_on_unmatched_files: true
           files: dist/*

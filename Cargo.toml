@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 [workspace]
 resolver = "2"
 members = [
@@ -10,6 +11,7 @@ members = [
 [workspace.package]
 version = "2026.1111.0"
 rust-version = "1.94"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 # Shared external dependencies
@@ -24,6 +26,7 @@ directories = "6.0"
 dropshot = "0.17"
 futures = "0.3"
 http = "1.5"
+http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.18"
 object = "0.40"
@@ -54,6 +57,7 @@ sha2 = "0.11"
 slog = "2.8"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 syn = "3.0"
+tar = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1.54", features = ["full"] }
 tokio-tungstenite = "0.30"

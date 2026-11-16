@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Append-only session data log.
 //!
 //! Each session has one file. Records are length-prefixed and carry a monotonic

@@ -45,10 +45,16 @@ The workflow:
 
 1. validates that the tag is semver, matches the workspace version, and points
    at a commit reachable from the default branch;
-2. runs `cargo test --workspace --locked`;
-3. cross-compiles `boot` for `x86_64-unknown-linux-gnu` and
-   `aarch64-unknown-linux-gnu`;
-4. publishes the raw binaries and their SHA-256 checksums to a GitHub Release.
+2. generates `boot-<version>-source.tar` from the tagged commit and verifies its
+   contents;
+3. generates `boot-<version>-dependencies.tar.xz` from the full Linux
+   normal-and-build dependency graph for both release targets;
+4. runs `cargo deny check licenses` and `cargo test --workspace --locked`;
+5. cross-compiles `boot` for `x86_64-unknown-linux-gnu` and
+   `aarch64-unknown-linux-gnu`, embedding the first-party source archive and
+   dependency source metadata;
+6. publishes the raw binaries, both source archives, and their SHA-256
+   checksums to a GitHub Release.
 
 Tags with a semver pre-release suffix, such as `v2026.1103.0-rc.1`, are
 published as GitHub pre-releases.
@@ -61,6 +67,15 @@ published as GitHub pre-releases.
 | `boot-x86_64-unknown-linux-gnu.sha256` | `sha256sum` output |
 | `boot-aarch64-unknown-linux-gnu` | raw release binary |
 | `boot-aarch64-unknown-linux-gnu.sha256` | `sha256sum` output |
+| `boot-<version>-source.tar` | first-party source embedded in both binaries |
+| `boot-<version>-source.tar.sha256` | `sha256sum` output |
+| `boot-<version>-dependencies.tar.xz` | full Linux dependency source bundle |
+| `boot-<version>-dependencies.tar.xz.sha256` | `sha256sum` output |
+
+The two-level source offer is available from a running server at
+`GET /v1/source`, `GET /v1/source/dependencies`, and `GET /v1/source/manifest`.
+The endpoints are public and must not be placed behind an auth proxy. See
+[licensing.md](licensing.md).
 
 ## Updating an installation
 

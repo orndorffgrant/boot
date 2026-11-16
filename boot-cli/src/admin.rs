@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Token administration. Commands use the HTTP admin API by default and can
 //! open the local API database directly with `--direct`.
 

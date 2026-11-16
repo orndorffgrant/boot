@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;

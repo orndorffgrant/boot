@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Bump the workspace CalVer version, commit it, and create an annotated tag.
 #
 # Usage: tools/release.sh

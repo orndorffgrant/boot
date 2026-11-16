@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! SQLite storage for the API database.
 //!
 //! The database is opened read-write by both the server and the CLI. It contains

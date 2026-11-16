@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Client-side credential handling and authentication checks.
 
 use std::io::Read;

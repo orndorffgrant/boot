@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Runtime: resources, leases, changes, sessions, and persistence.
 
 pub mod artifact;

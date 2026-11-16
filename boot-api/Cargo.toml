@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 [package]
 name = "boot-api"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -39,6 +41,13 @@ schemafy = { workspace = true, optional = true }
 addr2line = { workspace = true, optional = true }
 capstone = { workspace = true, optional = true }
 svd-parser = { workspace = true, optional = true }
+
+[build-dependencies]
+sha2.workspace = true
+tar.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
 
 [features]
 default = ["run"]

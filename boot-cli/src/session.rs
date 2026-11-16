@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use anyhow::Result;
 use clap::Args;
 use comfy_table::{Table, presets::NOTHING};

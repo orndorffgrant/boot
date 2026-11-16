@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shared wire types for the boot HTTP and WebSocket APIs.
 //!
 //! This crate has no dependency on the server runtime, hardware crates, or
@@ -305,6 +306,15 @@ pub struct SessionPatch {
 pub struct ServerStatus {
     pub version: String,
     pub protocol_version: u8,
+    pub license: String,
+    pub source_url: String,
+    pub source_sha256: String,
+    pub source_revision: String,
+    pub source_dirty: bool,
+    pub dependency_source_available: bool,
+    pub dependency_source_url: String,
+    pub dependency_source_sha256: String,
+    pub dependency_source_packages: usize,
     pub uptime_seconds: u64,
     pub health: String,
     pub probes: usize,
@@ -313,6 +323,18 @@ pub struct ServerStatus {
     pub sessions: usize,
     pub subscribers: usize,
     pub storage_bytes: u64,
+}
+
+/// Description of the dependency source bundle for this build.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DependencySource {
+    pub license: String,
+    pub available: bool,
+    pub url: String,
+    pub sha256: String,
+    pub filename: String,
+    pub targets: Vec<String>,
+    pub packages: usize,
 }
 
 /// Change-follow WebSocket messages. All frames are text JSON.

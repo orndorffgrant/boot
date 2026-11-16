@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Runtime persistence over the shared API SQLite database.
 //!
 //! Metadata/state rows live in `boot.sqlite3`. Session payloads live in

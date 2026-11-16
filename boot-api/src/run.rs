@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,11 +8,14 @@ use anyhow::{Context, Result, bail};
 use boot_protocol::*;
 use dropshot::{
     ConfigDropshot, ConfigLogging, ConfigLoggingLevel, ConfigTls, HttpError, HttpResponseAccepted,
-    HttpResponseCreated, HttpResponseHeaders, HttpResponseOk, Path, Query, RequestContext,
-    ServerBuilder, StreamingBody, TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
+    HttpResponseCreated, HttpResponseFound, HttpResponseHeaders, HttpResponseOk, Path, Query,
+    RequestContext, ServerBuilder, StreamingBody, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade,
 };
 use futures::{SinkExt, StreamExt};
-use http::header::{CACHE_CONTROL, LOCATION, PRAGMA};
+use http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LOCATION, PRAGMA,
+};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -25,11 +29,11 @@ use crate::runtime::{self, Runtime, RuntimeConfig, RuntimeError, session};
 use crate::store::{Store, default_data_dir, resolve_api_db_path};
 use crate::{
     AbortRequest, Artifact, ArtifactPath, BootApi, Change, ChangeCreated, ChangeWsMessage,
-    DeleteSessionQuery, Empty, ExportQuery, FlashRequest, FollowQuery, IdPath, InspectRequest,
-    IoQuery, ListQuery, Probe, ProbeSessionRequest, ResetRequest, RevokeAllQuery, RevokeResult,
-    SerialPort, SerialSessionRequest, ServerStatus, Session, SessionPatch, SessionWsMessage,
-    SetArtifactRequest, Subscriber, SubscriberPath, TokenCreateRequest, TokenCreated, TokenPath,
-    TokenSummary,
+    DeleteSessionQuery, DependencySource, Empty, ExportQuery, FlashRequest, FollowQuery, IdPath,
+    InspectRequest, IoQuery, ListQuery, Probe, ProbeSessionRequest, ResetRequest, RevokeAllQuery,
+    RevokeResult, SerialPort, SerialSessionRequest, ServerStatus, Session, SessionPatch,
+    SessionWsMessage, SetArtifactRequest, Subscriber, SubscriberPath, TokenCreateRequest,
+    TokenCreated, TokenPath, TokenSummary,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +128,15 @@ impl BootApi for ServerImpl {
         Ok(HttpResponseOk(ServerStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
+            license: crate::source::LICENSE.to_string(),
+            source_url: crate::source::URL.to_string(),
+            source_sha256: crate::source::SHA256.to_string(),
+            source_revision: crate::source::REVISION.to_string(),
+            source_dirty: crate::source::dirty(),
+            dependency_source_available: crate::source::dependency_source_available(),
+            dependency_source_url: crate::source::DEPENDENCY_SOURCE_URL.to_string(),
+            dependency_source_sha256: crate::source::DEPENDENCY_SOURCE_SHA256.to_string(),
+            dependency_source_packages: crate::source::dependency_source_packages(),
             uptime_seconds: 0,
             health: "ok".to_string(),
             probes: 0,
@@ -133,6 +146,72 @@ impl BootApi for ServerImpl {
             subscribers: 0,
             storage_bytes: 0,
         }))
+    }
+
+    async fn source(
+        _rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<dropshot::FreeformBody>>, HttpError> {
+        let body = dropshot::Body::with_content(crate::source::ARCHIVE);
+        let mut response =
+            HttpResponseHeaders::new_unnamed(HttpResponseOk(dropshot::FreeformBody(body)));
+        let headers = response.headers_mut();
+        headers.insert(
+            CONTENT_TYPE,
+            http::HeaderValue::from_static("application/x-tar"),
+        );
+        headers.insert(
+            CONTENT_LENGTH,
+            http::HeaderValue::from_str(&crate::source::ARCHIVE.len().to_string())
+                .expect("valid content length"),
+        );
+        headers.insert(
+            CONTENT_DISPOSITION,
+            http::HeaderValue::from_str(&format!(
+                "attachment; filename=\"{}\"",
+                crate::source::FILENAME
+            ))
+            .expect("valid source filename"),
+        );
+        headers.insert(
+            ETAG,
+            http::HeaderValue::from_str(&format!("\"{}\"", crate::source::SHA256))
+                .expect("valid source etag"),
+        );
+        headers.insert(
+            CACHE_CONTROL,
+            http::HeaderValue::from_static("public, no-cache"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-content-type-options"),
+            http::HeaderValue::from_static("nosniff"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-boot-source-sha256"),
+            http::HeaderValue::from_str(crate::source::SHA256).expect("valid source sha256"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-boot-source-revision"),
+            http::HeaderValue::from_str(crate::source::REVISION).expect("valid source revision"),
+        );
+        Ok(response)
+    }
+
+    async fn source_dependencies(
+        _rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseFound, HttpError> {
+        if !crate::source::dependency_source_available() {
+            return Err(HttpError::for_unavail(
+                Some("dependency_source_unavailable".to_string()),
+                "this build does not include a dependency source bundle".to_string(),
+            ));
+        }
+        dropshot::http_response_found(crate::source::DEPENDENCY_SOURCE_URL.to_string())
+    }
+
+    async fn source_manifest(
+        _rqctx: RequestContext<Self::Context>,
+    ) -> Result<HttpResponseOk<DependencySource>, HttpError> {
+        Ok(HttpResponseOk(crate::source::dependency_source()))
     }
 
     async fn server(
@@ -145,6 +224,15 @@ impl BootApi for ServerImpl {
         Ok(HttpResponseOk(ServerStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
+            license: crate::source::LICENSE.to_string(),
+            source_url: crate::source::URL.to_string(),
+            source_sha256: crate::source::SHA256.to_string(),
+            source_revision: crate::source::REVISION.to_string(),
+            source_dirty: crate::source::dirty(),
+            dependency_source_available: crate::source::dependency_source_available(),
+            dependency_source_url: crate::source::DEPENDENCY_SOURCE_URL.to_string(),
+            dependency_source_sha256: crate::source::DEPENDENCY_SOURCE_SHA256.to_string(),
+            dependency_source_packages: crate::source::dependency_source_packages(),
             uptime_seconds: runtime.inner.started.elapsed().as_secs(),
             health: "ok".to_string(),
             probes: resources
@@ -1298,8 +1386,12 @@ mod tests {
 
     use dropshot::Body;
     use dropshot::test_util::{TestContext, read_json};
-    use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+    use http::header::{
+        AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LOCATION,
+        WWW_AUTHENTICATE,
+    };
     use http::{Method, Request, Response, StatusCode};
+    use http_body_util::BodyExt;
 
     use crate::auth::{AuthState, CreateTokenRequest, Scopes};
     use crate::runtime::RuntimeConfig;
@@ -1410,6 +1502,123 @@ mod tests {
             response.headers().get(WWW_AUTHENTICATE).unwrap(),
             "Bearer realm=\"boot-api\""
         );
+        server.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn source_is_public_and_matches_embedded_archive() {
+        let server = TestServer::new("source").await;
+        let mut response = server
+            .send(
+                server.request(Method::GET, "/v1/source", None, ""),
+                StatusCode::OK,
+            )
+            .await;
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/x-tar"
+        );
+        let disposition = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.contains(crate::source::FILENAME));
+        assert_eq!(
+            response.headers().get(ETAG).unwrap().to_str().unwrap(),
+            format!("\"{}\"", crate::source::SHA256)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            crate::source::ARCHIVE.len().to_string()
+        );
+
+        let bytes = response
+            .body_mut()
+            .collect()
+            .await
+            .expect("read source body")
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), crate::source::ARCHIVE);
+
+        let mut response = server
+            .send(
+                server.request(Method::GET, "/v1/health", None, ""),
+                StatusCode::OK,
+            )
+            .await;
+        let status: crate::ServerStatus = read_json(&mut response).await;
+        assert_eq!(status.license, "AGPL-3.0-or-later");
+        assert_eq!(status.source_url, "/v1/source");
+        assert_eq!(status.source_sha256, crate::source::SHA256);
+        assert_eq!(
+            status.dependency_source_available,
+            crate::source::dependency_source_available()
+        );
+        assert_eq!(
+            status.dependency_source_url,
+            crate::source::DEPENDENCY_SOURCE_URL
+        );
+        assert_eq!(
+            status.dependency_source_sha256,
+            crate::source::DEPENDENCY_SOURCE_SHA256
+        );
+        assert_eq!(
+            status.dependency_source_packages,
+            crate::source::dependency_source_packages()
+        );
+
+        server.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn dependency_source_manifest_is_public() {
+        let server = TestServer::new("dependency-source").await;
+        let mut response = server
+            .send(
+                server.request(Method::GET, "/v1/source/manifest", None, ""),
+                StatusCode::OK,
+            )
+            .await;
+        let manifest: crate::DependencySource = read_json(&mut response).await;
+        assert_eq!(manifest.license, "AGPL-3.0-or-later");
+        assert!(manifest.filename.ends_with(".tar.xz"));
+        assert_eq!(
+            manifest.available,
+            crate::source::dependency_source_available()
+        );
+        assert_eq!(manifest.url, crate::source::DEPENDENCY_SOURCE_URL);
+        assert_eq!(manifest.sha256, crate::source::DEPENDENCY_SOURCE_SHA256);
+        assert_eq!(
+            manifest.packages,
+            crate::source::dependency_source_packages()
+        );
+
+        let expected = if manifest.available {
+            StatusCode::FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let response = server
+            .send(
+                server.request(Method::GET, "/v1/source/dependencies", None, ""),
+                expected,
+            )
+            .await;
+        if manifest.available {
+            assert_eq!(
+                response.headers().get(LOCATION).unwrap(),
+                crate::source::DEPENDENCY_SOURCE_URL
+            );
+        }
+
         server.teardown().await;
     }
 

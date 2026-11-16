@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `boot update` — replace the locally installed binary with a release
 //! published on GitHub.
 
