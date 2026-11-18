@@ -169,10 +169,26 @@ pub struct SessionOptions {
     pub baud_rate: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum SessionAcquire {
+    /// Attach to the active session if one exists, otherwise create one.
+    #[default]
+    #[serde(rename = "attach-or-create")]
+    AttachOrCreate,
+    /// Attach to an active session, or fail if none exists.
+    #[serde(rename = "attach")]
+    Attach,
+    /// Create a new session, or fail if the resource is already active.
+    #[serde(rename = "create")]
+    Create,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ProbeSessionRequest {
     /// `rtt` or `dap`.
     pub kind: String,
+    #[serde(default)]
+    pub acquire: SessionAcquire,
     #[serde(default)]
     pub options: SessionOptions,
     /// Firmware artifact to use for RTT address lookup and defmt decoding.
@@ -192,6 +208,8 @@ pub struct ProbeSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SerialSessionRequest {
+    #[serde(default)]
+    pub acquire: SessionAcquire,
     #[serde(default)]
     pub options: SessionOptions,
     #[serde(default = "default_max_subscribers")]
@@ -272,6 +290,12 @@ pub struct Session {
     pub data: SessionData,
     pub decode: SessionDecode,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionAcquireResult {
+    pub session: Session,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -468,6 +492,61 @@ pub enum SessionWsMessage {
     Pong,
 }
 
+/// One binary session data frame.
+///
+/// Layout: `u64` big-endian sequence, an optional channel byte for RTT, then
+/// the payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDataFrame<'a> {
+    pub seq: u64,
+    pub channel: Option<u8>,
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFrameError {
+    TooShort,
+}
+
+impl std::fmt::Display for SessionFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session frame is too short")
+    }
+}
+
+impl std::error::Error for SessionFrameError {}
+
+pub fn decode_session_frame<'a>(
+    kind: &str,
+    bytes: &'a [u8],
+) -> Result<SessionDataFrame<'a>, SessionFrameError> {
+    let channel_bytes = usize::from(kind == "rtt");
+    if bytes.len() < 8 + channel_bytes {
+        return Err(SessionFrameError::TooShort);
+    }
+    let seq = u64::from_be_bytes(bytes[..8].try_into().expect("checked length"));
+    let (channel, offset) = if channel_bytes == 1 {
+        (Some(bytes[8]), 9)
+    } else {
+        (None, 8)
+    };
+    Ok(SessionDataFrame {
+        seq,
+        channel,
+        data: &bytes[offset..],
+    })
+}
+
+pub fn encode_session_frame(kind: &str, seq: u64, channel: u8, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(9 + data.len());
+    frame.extend_from_slice(&seq.to_be_bytes());
+    if kind == "rtt" {
+        frame.push(channel);
+    }
+    frame.extend_from_slice(data);
+    frame
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ApiErrorBody {
     pub code: String,
@@ -525,5 +604,44 @@ mod tests {
         assert_eq!(decode.mode, "raw");
         assert_eq!(decode.epoch, 0);
         assert!(decode.artifact.is_none());
+    }
+
+    #[test]
+    fn session_data_frames_round_trip() {
+        let rtt = encode_session_frame("rtt", 7, 3, b"hello");
+        let frame = decode_session_frame("rtt", &rtt).unwrap();
+        assert_eq!(frame.seq, 7);
+        assert_eq!(frame.channel, Some(3));
+        assert_eq!(frame.data, b"hello");
+
+        let serial = encode_session_frame("serial", 9, 0, b"world");
+        let frame = decode_session_frame("serial", &serial).unwrap();
+        assert_eq!(frame.seq, 9);
+        assert_eq!(frame.channel, None);
+        assert_eq!(frame.data, b"world");
+    }
+
+    #[test]
+    fn session_data_frame_rejects_short_input() {
+        assert_eq!(
+            decode_session_frame("serial", &[0; 7]),
+            Err(SessionFrameError::TooShort)
+        );
+        assert_eq!(
+            decode_session_frame("rtt", &[0; 8]),
+            Err(SessionFrameError::TooShort)
+        );
+    }
+
+    #[test]
+    fn session_acquire_serializes_as_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&SessionAcquire::AttachOrCreate).unwrap(),
+            "\"attach-or-create\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionAcquire::Attach).unwrap(),
+            "\"attach\""
+        );
     }
 }

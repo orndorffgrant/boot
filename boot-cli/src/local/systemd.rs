@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::env;
 use std::ffi::OsString;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+
+use crate::error::CliError;
 
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
@@ -230,6 +235,79 @@ fn parse_exec_start(text: &str) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(path))
+    }
+}
+
+pub fn edit_document(initial: &str) -> Result<String, CliError> {
+    let temp = TempFile::create(initial)?;
+    run_editor(temp.path())?;
+    Ok(fs::read_to_string(temp.path())
+        .with_context(|| format!("Failed to read {}", temp.path().display()))?)
+}
+
+fn run_editor(path: &Path) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("edit-server requires an interactive terminal");
+    }
+    let editor = env::var("EDITOR").unwrap_or_default();
+    if editor.trim().is_empty() {
+        anyhow::bail!(
+            "EDITOR is not set; set it to an editor command such as 'vi' or 'code --wait'"
+        );
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"$1\"", editor))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .with_context(|| format!("Failed to run editor '{editor}'"))?;
+    if !status.success() {
+        anyhow::bail!("Editor exited with status {status}");
+    }
+    Ok(())
+}
+
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn create(contents: &str) -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = env::temp_dir().join(format!(
+            ".boot-edit-server-{}-{nanos}.yaml",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        file.sync_all()?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

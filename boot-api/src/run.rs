@@ -30,10 +30,10 @@ use crate::store::{Store, default_data_dir, resolve_api_db_path};
 use crate::{
     AbortRequest, Artifact, ArtifactPath, BootApi, Change, ChangeCreated, ChangeWsMessage,
     DeleteSessionQuery, DependencySource, Empty, ExportQuery, FlashRequest, FollowQuery, IdPath,
-    InspectRequest, IoQuery, ListQuery, Probe, ProbeSessionRequest, ResetRequest, RevokeAllQuery,
-    RevokeResult, SerialPort, SerialSessionRequest, ServerStatus, Session, SessionPatch,
-    SessionWsMessage, SetArtifactRequest, Subscriber, SubscriberPath, TokenCreateRequest,
-    TokenCreated, TokenPath, TokenSummary,
+    InspectRequest, IoQuery, ListQuery, Probe, ProbeSessionRequest, ResetRequest, ResolveQuery,
+    RevokeAllQuery, RevokeResult, SerialPort, SerialSessionRequest, ServerStatus, Session,
+    SessionAcquireResult, SessionPatch, SessionWsMessage, SetArtifactRequest, Subscriber,
+    SubscriberPath, TokenCreateRequest, TokenCreated, TokenPath, TokenSummary,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -57,11 +57,16 @@ fn runtime(rqctx: &RequestContext<AuthState>) -> Result<&Runtime, HttpError> {
 
 fn map_error(error: RuntimeError) -> HttpError {
     let status = match error.code {
-        "not_found" => dropshot::ClientErrorStatusCode::NOT_FOUND,
-        "resource_busy" | "conflict" | "not_resumable" | "dap_exclusive" | "session_active" => {
-            dropshot::ClientErrorStatusCode::CONFLICT
-        }
-        "invalid_request" | "invalid_artifact" | "not_rtt_session" => {
+        "not_found" | "session_not_found" => dropshot::ClientErrorStatusCode::NOT_FOUND,
+        "resource_busy"
+        | "conflict"
+        | "not_resumable"
+        | "dap_exclusive"
+        | "session_active"
+        | "ambiguous_selector"
+        | "idempotency_in_progress"
+        | "idempotency_conflict" => dropshot::ClientErrorStatusCode::CONFLICT,
+        "invalid_request" | "invalid_artifact" | "invalid_selector" | "not_rtt_session" => {
             dropshot::ClientErrorStatusCode::BAD_REQUEST
         }
         "artifact_in_use" | "session_closed" => dropshot::ClientErrorStatusCode::CONFLICT,
@@ -85,6 +90,33 @@ fn ensure_change_access(auth: &Auth<Control>, change: &Change) -> Result<(), Htt
 
 fn location(uri: String) -> http::HeaderValue {
     http::HeaderValue::from_str(&uri).expect("valid location header")
+}
+
+fn idempotency_key(rqctx: &RequestContext<AuthState>) -> Option<String> {
+    rqctx
+        .request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn accepted_change(change: Change) -> HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>> {
+    let created = ChangeCreated {
+        change: change.id.clone(),
+        status: change.status,
+    };
+    let mut response = HttpResponseHeaders::new_unnamed(HttpResponseAccepted(created));
+    response
+        .headers_mut()
+        .insert(LOCATION, location(format!("/v1/changes/{}", change.id)));
+    response
+}
+
+fn request_hash(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "invalid-request".to_string())
 }
 
 fn probe_from_resource(runtime: &Runtime, resource: &runtime::ResourceEntry) -> Probe {
@@ -277,6 +309,18 @@ impl BootApi for ServerImpl {
         Ok(HttpResponseOk(probe_from_resource(runtime, &resource)))
     }
 
+    async fn resolve_probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        query: Query<ResolveQuery>,
+    ) -> Result<HttpResponseOk<Probe>, HttpError> {
+        let runtime = runtime(&rqctx)?;
+        let resource = runtime
+            .resource_by_selector(runtime::ResourceKind::Probe, &query.into_inner().selector)
+            .map_err(map_error)?;
+        Ok(HttpResponseOk(probe_from_resource(runtime, &resource)))
+    }
+
     async fn serial_ports(
         rqctx: RequestContext<Self::Context>,
         _auth: Auth<Read>,
@@ -304,6 +348,21 @@ impl BootApi for ServerImpl {
         Ok(HttpResponseOk(serial_from_resource(&resource)))
     }
 
+    async fn resolve_serial_port(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        query: Query<ResolveQuery>,
+    ) -> Result<HttpResponseOk<SerialPort>, HttpError> {
+        let runtime = runtime(&rqctx)?;
+        let resource = runtime
+            .resource_by_selector(
+                runtime::ResourceKind::SerialPort,
+                &query.into_inner().selector,
+            )
+            .map_err(map_error)?;
+        Ok(HttpResponseOk(serial_from_resource(&resource)))
+    }
+
     async fn flash_probe(
         rqctx: RequestContext<Self::Context>,
         auth: Auth<Control>,
@@ -311,25 +370,43 @@ impl BootApi for ServerImpl {
         body: TypedBody<FlashRequest>,
     ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError> {
         let runtime = runtime(&rqctx)?;
+        let resource_id = path.into_inner().id;
         let request = body.into_inner();
+        let principal = auth.principal().id.clone();
+        let key = idempotency_key(&rqctx);
+        let hash = request_hash(&(
+            "flash",
+            &resource_id,
+            request.artifact.clone(),
+            request.options,
+        ));
+        if let Some(key) = &key {
+            if let Some(change) = runtime
+                .idempotent_change(&principal, key, &hash)
+                .map_err(map_error)?
+            {
+                return Ok(accepted_change(change));
+            }
+            runtime
+                .reserve_idempotency(&principal, key, &hash)
+                .map_err(map_error)?;
+        }
         let change = runtime
-            .create_flash(
-                &path.into_inner().id,
-                &request.artifact,
-                request.options,
-                &auth.principal().id,
-            )
-            .await
-            .map_err(map_error)?;
-        let created = ChangeCreated {
-            change: change.id.clone(),
-            status: change.status,
+            .create_flash(&resource_id, &request.artifact, request.options, &principal)
+            .await;
+        let change = match change {
+            Ok(change) => change,
+            Err(error) => {
+                if let Some(key) = &key {
+                    runtime.cancel_idempotency(&principal, key);
+                }
+                return Err(map_error(error));
+            }
         };
-        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseAccepted(created));
-        response
-            .headers_mut()
-            .insert(LOCATION, location(format!("/v1/changes/{}", change.id)));
-        Ok(response)
+        if let Some(key) = &key {
+            runtime.complete_idempotency(&principal, key, &change.id);
+        }
+        Ok(accepted_change(change))
     }
 
     async fn reset_probe(
@@ -339,19 +416,35 @@ impl BootApi for ServerImpl {
         _body: TypedBody<ResetRequest>,
     ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError> {
         let runtime = runtime(&rqctx)?;
-        let change = runtime
-            .create_reset(&path.into_inner().id, &auth.principal().id)
-            .await
-            .map_err(map_error)?;
-        let created = ChangeCreated {
-            change: change.id.clone(),
-            status: change.status,
+        let resource_id = path.into_inner().id;
+        let principal = auth.principal().id.clone();
+        let key = idempotency_key(&rqctx);
+        let hash = request_hash(&("reset", &resource_id));
+        if let Some(key) = &key {
+            if let Some(change) = runtime
+                .idempotent_change(&principal, key, &hash)
+                .map_err(map_error)?
+            {
+                return Ok(accepted_change(change));
+            }
+            runtime
+                .reserve_idempotency(&principal, key, &hash)
+                .map_err(map_error)?;
+        }
+        let change = runtime.create_reset(&resource_id, &principal).await;
+        let change = match change {
+            Ok(change) => change,
+            Err(error) => {
+                if let Some(key) = &key {
+                    runtime.cancel_idempotency(&principal, key);
+                }
+                return Err(map_error(error));
+            }
         };
-        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseAccepted(created));
-        response
-            .headers_mut()
-            .insert(LOCATION, location(format!("/v1/changes/{}", change.id)));
-        Ok(response)
+        if let Some(key) = &key {
+            runtime.complete_idempotency(&principal, key, &change.id);
+        }
+        Ok(accepted_change(change))
     }
 
     async fn inspect_probe(
@@ -361,19 +454,35 @@ impl BootApi for ServerImpl {
         _body: TypedBody<InspectRequest>,
     ) -> Result<HttpResponseHeaders<HttpResponseAccepted<ChangeCreated>>, HttpError> {
         let runtime = runtime(&rqctx)?;
-        let change = runtime
-            .create_inspect(&path.into_inner().id, &auth.principal().id)
-            .await
-            .map_err(map_error)?;
-        let created = ChangeCreated {
-            change: change.id.clone(),
-            status: change.status,
+        let resource_id = path.into_inner().id;
+        let principal = auth.principal().id.clone();
+        let key = idempotency_key(&rqctx);
+        let hash = request_hash(&("inspect", &resource_id));
+        if let Some(key) = &key {
+            if let Some(change) = runtime
+                .idempotent_change(&principal, key, &hash)
+                .map_err(map_error)?
+            {
+                return Ok(accepted_change(change));
+            }
+            runtime
+                .reserve_idempotency(&principal, key, &hash)
+                .map_err(map_error)?;
+        }
+        let change = runtime.create_inspect(&resource_id, &principal).await;
+        let change = match change {
+            Ok(change) => change,
+            Err(error) => {
+                if let Some(key) = &key {
+                    runtime.cancel_idempotency(&principal, key);
+                }
+                return Err(map_error(error));
+            }
         };
-        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseAccepted(created));
-        response
-            .headers_mut()
-            .insert(LOCATION, location(format!("/v1/changes/{}", change.id)));
-        Ok(response)
+        if let Some(key) = &key {
+            runtime.complete_idempotency(&principal, key, &change.id);
+        }
+        Ok(accepted_change(change))
     }
 
     async fn list_changes(
@@ -459,13 +568,14 @@ impl BootApi for ServerImpl {
         auth: Auth<Control>,
         path: Path<IdPath>,
         body: TypedBody<ProbeSessionRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError> {
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SessionAcquireResult>>, HttpError> {
         let runtime = runtime(&rqctx)?;
         let request = body.into_inner();
-        let session = runtime
+        let result = runtime
             .create_probe_session(
                 &path.into_inner().id,
                 &request.kind,
+                request.acquire,
                 request.options,
                 request.artifact.as_deref(),
                 request.inherit_artifact,
@@ -476,10 +586,11 @@ impl BootApi for ServerImpl {
             )
             .await
             .map_err(map_error)?;
-        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseCreated(session.clone()));
-        response
-            .headers_mut()
-            .insert(LOCATION, location(format!("/v1/sessions/{}", session.id)));
+        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseOk(result.clone()));
+        response.headers_mut().insert(
+            LOCATION,
+            location(format!("/v1/sessions/{}", result.session.id)),
+        );
         Ok(response)
     }
 
@@ -528,12 +639,13 @@ impl BootApi for ServerImpl {
         auth: Auth<Control>,
         path: Path<IdPath>,
         body: TypedBody<SerialSessionRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError> {
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SessionAcquireResult>>, HttpError> {
         let runtime = runtime(&rqctx)?;
         let request = body.into_inner();
-        let session = runtime
+        let result = runtime
             .create_serial_session(
                 &path.into_inner().id,
+                request.acquire,
                 request.options,
                 &auth.principal().id,
                 request.max_subscribers,
@@ -542,10 +654,11 @@ impl BootApi for ServerImpl {
             )
             .await
             .map_err(map_error)?;
-        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseCreated(session.clone()));
-        response
-            .headers_mut()
-            .insert(LOCATION, location(format!("/v1/sessions/{}", session.id)));
+        let mut response = HttpResponseHeaders::new_unnamed(HttpResponseOk(result.clone()));
+        response.headers_mut().insert(
+            LOCATION,
+            location(format!("/v1/sessions/{}", result.session.id)),
+        );
         Ok(response)
     }
 
@@ -1258,12 +1371,7 @@ async fn send_binary<S>(tx: &mut S, kind: &str, seq: u64, channel: u8, data: &[u
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let mut frame = Vec::with_capacity(9 + data.len());
-    frame.extend_from_slice(&seq.to_be_bytes());
-    if kind == "rtt" {
-        frame.push(channel);
-    }
-    frame.extend_from_slice(data);
+    let frame = boot_protocol::encode_session_frame(kind, seq, channel, data);
     tx.send(Message::Binary(frame.into())).await?;
     Ok(())
 }

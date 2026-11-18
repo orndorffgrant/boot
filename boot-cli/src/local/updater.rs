@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `boot update` — replace the locally installed binary with a release
-//! published on GitHub.
+//! Self-update mechanics: release lookup, download, verification, replacement.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -10,41 +9,19 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::Args;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::admin::confirm;
-use crate::systemd_service;
+use crate::error::CliError;
+use crate::local::systemd;
+use crate::plan::{ReleaseAsset, ReleaseInfo};
 
 const DEFAULT_REPO: &str = "orndorffgrant/boot";
 const API_BASE: &str = "https://api.github.com";
 const MAX_ASSET_BYTES: u64 = 200 * 1024 * 1024;
-
-#[derive(Args)]
-pub struct UpdateArgs {
-    /// Report the installed and available versions without changing anything
-    #[arg(long)]
-    pub check: bool,
-    /// Install a specific release tag instead of the latest release
-    #[arg(long, value_name = "TAG")]
-    pub version: Option<String>,
-    /// Reinstall the same version or allow a downgrade
-    #[arg(long)]
-    pub force: bool,
-    /// Skip the confirmation prompt
-    #[arg(short = 'y', long)]
-    pub yes: bool,
-    /// Replace the binary but leave the running service on the old process
-    #[arg(long)]
-    pub no_restart: bool,
-    /// Use a fork or mirror (OWNER/REPO)
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub repo: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -64,65 +41,80 @@ struct Asset {
     size: u64,
 }
 
-pub async fn update(args: UpdateArgs) -> Result<()> {
-    let repo = resolve_repo(args.repo.as_deref())?;
-    let requested_tag = args.version.as_deref().map(normalize_tag);
+pub async fn fetch_release(
+    repo: Option<&str>,
+    version: Option<&str>,
+) -> Result<ReleaseInfo, CliError> {
+    let repo = resolve_repo(repo)?;
+    let requested_tag = version.map(normalize_tag);
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .context("the compiled boot version is not valid semver")?;
-
     let api = api_client()?;
-    let release = fetch_release(&api, &repo, requested_tag.as_deref()).await?;
+    let release = fetch_release_json(&api, &repo, requested_tag.as_deref()).await?;
     let available = parse_tag_version(&release.tag_name)?;
+    Ok(ReleaseInfo {
+        current: current.to_string(),
+        available: available.to_string(),
+        tag: release.tag_name,
+        html_url: release.html_url,
+        prerelease: release.prerelease,
+        assets: release
+            .assets
+            .into_iter()
+            .map(|asset| ReleaseAsset {
+                name: asset.name,
+                url: asset.browser_download_url,
+                size: asset.size,
+            })
+            .collect(),
+    })
+}
 
-    println!("Installed: {current}");
-    println!("Available: {available}");
-    println!("Release:   {}", release.html_url);
-
-    if args.check {
-        if available > current {
-            println!("Update available.");
-        } else if available == current {
-            println!("Already up to date.");
-        } else {
-            println!("Installed version is newer than the selected release.");
-        }
-        return Ok(());
-    }
-
-    if available < current && !args.force {
-        anyhow::bail!(
+pub async fn install_release(
+    release: &ReleaseInfo,
+    force: bool,
+    no_restart: bool,
+    progress: &(dyn Fn(u64, Option<u64>) + Send + Sync),
+) -> Result<String, CliError> {
+    let current = Version::parse(&release.current)
+        .context("the installed boot version is not valid semver")?;
+    let available = Version::parse(&release.available)
+        .context("the selected release version is not valid semver")?;
+    if available < current && !force {
+        return Err(CliError::config(format!(
             "refusing to downgrade from {current} to {available}; pass --force to allow it"
-        );
+        )));
     }
-    if available == current && !args.force {
-        anyhow::bail!("{current} is already installed; pass --force to reinstall it");
+    if available == current && !force {
+        return Err(CliError::config(format!(
+            "{current} is already installed; pass --force to reinstall it"
+        )));
     }
     if release.prerelease {
-        eprintln!("Warning: {available} is a pre-release.");
+        eprintln!("warning: {available} is a pre-release.");
     }
 
     let executable = current_executable()?;
     let directory = executable
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine the install directory"))?;
+        .ok_or_else(|| CliError::config("cannot determine the install directory"))?;
     check_writable(directory)?;
 
     let target = current_target()?;
     let binary_name = format!("boot-{target}");
     let checksum_name = format!("{binary_name}.sha256");
-    let binary_asset = find_asset(&release, &binary_name)?;
-    let checksum_asset = find_asset(&release, &checksum_name)?;
+    let binary_asset = find_asset(release, &binary_name)?;
+    let checksum_asset = find_asset(release, &checksum_name)?;
 
-    let service_active = systemd_service::is_service_active()?;
-    let service_executable = systemd_service::service_executable()?;
+    let service_active = systemd::is_service_active()?;
+    let service_executable = systemd::service_executable()?;
     if let Some(service_path) = &service_executable {
         let service_path = service_path
             .canonicalize()
             .unwrap_or_else(|_| service_path.clone());
         if service_path != executable {
             eprintln!(
-                "Warning: the boot-api unit runs {}, which differs from the invoking binary {}. \
-                 The service may not use the replaced file.",
+                "warning: the boot-api unit runs {}, which differs from the invoking binary {}.",
                 service_path.display(),
                 executable.display()
             );
@@ -131,16 +123,12 @@ pub async fn update(args: UpdateArgs) -> Result<()> {
 
     eprintln!("This will replace {}.", executable.display());
     match service_active {
-        Some(true) if args.no_restart => {
-            eprintln!(
-                "--no-restart: boot-api will keep running the old binary until it is restarted \
-                 manually."
-            );
+        Some(true) if no_restart => {
+            eprintln!("--no-restart: boot-api will keep running the old binary until restarted.");
         }
         Some(true) => {
             eprintln!(
-                "boot-api will restart; in-flight flash, debug, and serial operations will be \
-                 interrupted."
+                "boot-api will restart; in-flight flash, debug, and serial operations will be interrupted."
             );
         }
         Some(false) => {
@@ -152,19 +140,18 @@ pub async fn update(args: UpdateArgs) -> Result<()> {
             );
         }
     }
-    confirm("Continue with the update?", args.yes)?;
 
     let download = download_client()?;
-    let checksum_text = String::from_utf8(download_asset(&download, checksum_asset).await?)
-        .context("the checksum asset is not valid UTF-8")?;
+    let checksum_text =
+        String::from_utf8(download_asset(&download, checksum_asset, progress).await?)
+            .context("the checksum asset is not valid UTF-8")?;
     let expected = parse_checksum(&checksum_text)?;
-    let bytes = download_asset(&download, binary_asset).await?;
+    let bytes = download_asset(&download, binary_asset, progress).await?;
     let actual = sha256_hex(&bytes);
     if actual != expected {
-        anyhow::bail!(
-            "checksum mismatch for {binary_name}: expected {expected}, got {actual}; \
-             nothing was changed"
-        );
+        return Err(CliError::config(format!(
+            "checksum mismatch for {binary_name}: expected {expected}, got {actual}; nothing was changed"
+        )));
     }
 
     let (new_file, mut file) = TempFile::create_with_file(directory, "new")?;
@@ -200,8 +187,8 @@ pub async fn update(args: UpdateArgs) -> Result<()> {
     })?;
     new_file.disarm();
 
-    if service_active == Some(true) && !args.no_restart {
-        if let Err(restart_error) = systemd_service::restart_service() {
+    if service_active == Some(true) && !no_restart {
+        if let Err(restart_error) = systemd::restart_service() {
             return rollback(
                 backup,
                 &executable,
@@ -212,13 +199,7 @@ pub async fn update(args: UpdateArgs) -> Result<()> {
     }
 
     backup.disarm();
-    println!("Updated boot to {available}.");
-    if service_active == Some(true) && !args.no_restart {
-        println!("boot-api restarted.");
-    } else if service_active == Some(true) {
-        println!("boot-api is still running the old binary; restart it to activate {available}.");
-    }
-    Ok(())
+    Ok(available.to_string())
 }
 
 fn rollback(
@@ -226,42 +207,41 @@ fn rollback(
     executable: &Path,
     restart_error: anyhow::Error,
     service_was_active: bool,
-) -> Result<()> {
+) -> Result<String, CliError> {
     match fs::rename(backup.path(), executable) {
         Ok(()) => {
             backup.disarm();
             if service_was_active {
-                match systemd_service::restart_service() {
-                    Ok(()) => anyhow::bail!(
-                        "boot-api failed to restart: {restart_error}. Rolled back to the previous \
-                         binary and restarted it."
-                    ),
-                    Err(old_error) => anyhow::bail!(
-                        "boot-api failed to restart: {restart_error}. Rolled back to the previous \
-                         binary, but restarting the old service also failed: {old_error}. Restart \
-                         boot-api manually."
-                    ),
+                match systemd::restart_service() {
+                    Ok(()) => {
+                        return Err(CliError::config(format!(
+                            "boot-api failed to restart: {restart_error}. Rolled back and restarted the previous binary."
+                        )));
+                    }
+                    Err(old_error) => {
+                        return Err(CliError::config(format!(
+                            "boot-api failed to restart: {restart_error}. Rolled back, but restarting the old service also failed: {old_error}. Restart boot-api manually."
+                        )));
+                    }
                 }
             }
-            anyhow::bail!(
+            Err(CliError::config(format!(
                 "boot-api failed to restart: {restart_error}. Rolled back to the previous binary."
-            )
+            )))
         }
         Err(rollback_error) => {
             let backup_path = backup.disarm();
-            anyhow::bail!(
-                "boot-api failed to restart: {restart_error}. Rollback also failed: \
-                 {rollback_error}. The previous binary is saved at {}. Restore it manually with: \
-                 mv {} {}",
+            Err(CliError::config(format!(
+                "boot-api failed to restart: {restart_error}. Rollback also failed: {rollback_error}. The previous binary is saved at {}. Restore it with: mv {} {}",
                 backup_path.display(),
                 backup_path.display(),
                 executable.display()
-            )
+            )))
         }
     }
 }
 
-fn resolve_repo(explicit: Option<&str>) -> Result<String> {
+fn resolve_repo(explicit: Option<&str>) -> Result<String, CliError> {
     let repo = explicit
         .map(str::to_string)
         .or_else(|| env::var("BOOT_RELEASE_REPO").ok())
@@ -272,7 +252,9 @@ fn resolve_repo(explicit: Option<&str>) -> Result<String> {
     let owner = parts.next().unwrap_or_default();
     let name = parts.next().unwrap_or_default();
     if owner.is_empty() || name.is_empty() || parts.next().is_some() {
-        anyhow::bail!("invalid repository '{repo}'; expected OWNER/REPO");
+        return Err(CliError::config(format!(
+            "invalid repository '{repo}'; expected OWNER/REPO"
+        )));
     }
     Ok(repo.to_string())
 }
@@ -285,42 +267,46 @@ fn normalize_tag(tag: &str) -> String {
     }
 }
 
-fn parse_tag_version(tag: &str) -> Result<Version> {
+fn parse_tag_version(tag: &str) -> Result<Version, CliError> {
     let version = tag.strip_prefix('v').unwrap_or(tag);
-    Version::parse(version).with_context(|| format!("release tag '{tag}' is not valid semver"))
+    Version::parse(version)
+        .map_err(|_| CliError::config(format!("release tag '{tag}' is not valid semver")))
 }
 
-fn current_executable() -> Result<PathBuf> {
-    let executable = env::current_exe().context("failed to determine the current executable")?;
+fn current_executable() -> Result<PathBuf, CliError> {
+    let executable = env::current_exe().map_err(|error| {
+        CliError::config(format!(
+            "failed to determine the current executable: {error}"
+        ))
+    })?;
     Ok(executable.canonicalize().unwrap_or(executable))
 }
 
-fn current_target() -> Result<&'static str> {
+fn current_target() -> Result<&'static str, CliError> {
     if !cfg!(target_env = "gnu") {
-        anyhow::bail!("boot update only supports glibc targets");
+        return Err(CliError::config("boot update only supports glibc targets"));
     }
     match (env::consts::ARCH, env::consts::OS) {
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
         ("aarch64", "linux") => Ok("aarch64-unknown-linux-gnu"),
-        (arch, os) => anyhow::bail!(
-            "unsupported platform {arch}-{os}; supported targets are \
-             x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu"
-        ),
+        (arch, os) => Err(CliError::config(format!(
+            "unsupported platform {arch}-{os}; supported targets are x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu"
+        ))),
     }
 }
 
-fn check_writable(directory: &Path) -> Result<()> {
-    let probe = TempFile::create(directory, "probe").with_context(|| {
-        format!(
-            "{} is not writable; run the update with sudo or install boot in a writable directory",
+fn check_writable(directory: &Path) -> Result<(), CliError> {
+    let probe = TempFile::create(directory, "probe").map_err(|error| {
+        CliError::config(format!(
+            "{} is not writable; run the update with sudo or install boot in a writable directory: {error}",
             directory.display()
-        )
+        ))
     })?;
     drop(probe);
     Ok(())
 }
 
-fn api_client() -> Result<Client> {
+fn api_client() -> Result<Client, CliError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         ACCEPT,
@@ -329,7 +315,7 @@ fn api_client() -> Result<Client> {
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         if !token.trim().is_empty() {
             let value = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
-                .context("GITHUB_TOKEN contains invalid header characters")?;
+                .map_err(|_| CliError::config("GITHUB_TOKEN contains invalid header characters"))?;
             headers.insert(AUTHORIZATION, value);
         }
     }
@@ -337,17 +323,23 @@ fn api_client() -> Result<Client> {
         .user_agent(format!("boot/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .build()
-        .context("failed to build the GitHub API client")
+        .map_err(|error| {
+            CliError::config(format!("failed to build the GitHub API client: {error}"))
+        })
 }
 
-fn download_client() -> Result<Client> {
+fn download_client() -> Result<Client, CliError> {
     Client::builder()
         .user_agent(format!("boot/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .context("failed to build the download client")
+        .map_err(|error| CliError::config(format!("failed to build the download client: {error}")))
 }
 
-async fn fetch_release(client: &Client, repo: &str, tag: Option<&str>) -> Result<Release> {
+async fn fetch_release_json(
+    client: &Client,
+    repo: &str,
+    tag: Option<&str>,
+) -> Result<Release, CliError> {
     let url = match tag {
         Some(tag) => format!("{API_BASE}/repos/{repo}/releases/tags/{tag}"),
         None => format!("{API_BASE}/repos/{repo}/releases/latest"),
@@ -356,35 +348,36 @@ async fn fetch_release(client: &Client, repo: &str, tag: Option<&str>) -> Result
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("failed to query {url}"))?;
+        .map_err(|error| CliError::config(format!("failed to query {url}: {error}")))?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("failed to read the GitHub API response")?;
-
+    let body = response.text().await.map_err(|error| {
+        CliError::config(format!("failed to read the GitHub API response: {error}"))
+    })?;
     if status.is_success() {
-        return serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse the GitHub API response from {url}"));
+        return serde_json::from_str(&body).map_err(|error| {
+            CliError::config(format!("failed to parse the GitHub API response: {error}"))
+        });
     }
-
     match status {
         StatusCode::NOT_FOUND => match tag {
-            Some(tag) => anyhow::bail!("release tag '{tag}' was not found in {repo}"),
-            None => anyhow::bail!("no releases were found in {repo}"),
+            Some(tag) => Err(CliError::config(format!(
+                "release tag '{tag}' was not found in {repo}"
+            ))),
+            None => Err(CliError::config(format!(
+                "no releases were found in {repo}"
+            ))),
         },
-        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => anyhow::bail!(
-            "GitHub API request failed with {status}; the rate limit may be exhausted. \
-             Set GITHUB_TOKEN to raise the limit."
-        ),
-        _ => anyhow::bail!(
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => Err(CliError::config(
+            "GitHub API request failed; the rate limit may be exhausted. Set GITHUB_TOKEN to raise the limit.",
+        )),
+        _ => Err(CliError::config(format!(
             "GitHub API request failed with {status}: {}",
             body.trim().chars().take(300).collect::<String>()
-        ),
+        ))),
     }
 }
 
-fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a Asset> {
+fn find_asset<'a>(release: &'a ReleaseInfo, name: &str) -> Result<&'a ReleaseAsset, CliError> {
     release
         .assets
         .iter()
@@ -396,86 +389,88 @@ fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a Asset> {
                 .map(|asset| asset.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::anyhow!(
+            CliError::config(format!(
                 "release {} does not contain asset '{name}'; available assets: {}",
-                release.tag_name,
+                release.tag,
                 if available.is_empty() {
                     "(none)"
                 } else {
                     available.as_str()
                 }
-            )
+            ))
         })
 }
 
-async fn download_asset(client: &Client, asset: &Asset) -> Result<Vec<u8>> {
-    let url = Url::parse(&asset.browser_download_url)
-        .with_context(|| format!("invalid asset URL '{}'", asset.browser_download_url))?;
+async fn download_asset(
+    client: &Client,
+    asset: &ReleaseAsset,
+    progress: &(dyn Fn(u64, Option<u64>) + Send + Sync),
+) -> Result<Vec<u8>, CliError> {
+    let url = Url::parse(&asset.url)
+        .map_err(|_| CliError::config(format!("invalid asset URL '{}'", asset.url)))?;
     if url.scheme() != "https" {
-        anyhow::bail!("refusing to download {} over {}", asset.name, url.scheme());
+        return Err(CliError::config(format!(
+            "refusing to download {} over {}",
+            asset.name,
+            url.scheme()
+        )));
     }
     if asset.size > MAX_ASSET_BYTES {
-        anyhow::bail!(
+        return Err(CliError::config(format!(
             "asset {} is {} bytes, larger than the {} byte limit",
-            asset.name,
-            asset.size,
-            MAX_ASSET_BYTES
-        );
+            asset.name, asset.size, MAX_ASSET_BYTES
+        )));
     }
-
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to download {}", asset.name))?;
+    let response =
+        client.get(url).send().await.map_err(|error| {
+            CliError::config(format!("failed to download {}: {error}", asset.name))
+        })?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("failed to download {}: HTTP {status}", asset.name);
+        return Err(CliError::config(format!(
+            "failed to download {}: HTTP {status}",
+            asset.name
+        )));
     }
-    if let Some(length) = response.content_length() {
-        if length > MAX_ASSET_BYTES {
-            anyhow::bail!(
-                "asset {} is {} bytes, larger than the {} byte limit",
-                asset.name,
-                length,
-                MAX_ASSET_BYTES
-            );
-        }
-    }
-
+    let total = response.content_length().or(Some(asset.size));
+    progress(0, total);
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     use futures::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("failed while downloading {}", asset.name))?;
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_ASSET_BYTES {
-            anyhow::bail!(
-                "asset {} exceeded the {} byte limit",
-                asset.name,
-                MAX_ASSET_BYTES
-            );
-        }
+        let chunk = chunk.map_err(|error| {
+            CliError::config(format!("failed while downloading {}: {error}", asset.name))
+        })?;
         bytes.extend_from_slice(&chunk);
+        progress(bytes.len() as u64, total);
+        if bytes.len() as u64 > MAX_ASSET_BYTES {
+            return Err(CliError::config(format!(
+                "asset {} exceeded the {} byte limit",
+                asset.name, MAX_ASSET_BYTES
+            )));
+        }
     }
     Ok(bytes)
 }
 
-fn parse_checksum(text: &str) -> Result<String> {
+fn parse_checksum(text: &str) -> Result<String, CliError> {
     let line = text
         .lines()
         .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("the checksum asset is empty"))?;
+        .ok_or_else(|| CliError::config("the checksum asset is empty"))?;
     let checksum = line
         .split_whitespace()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("the checksum asset is malformed"))?
+        .ok_or_else(|| CliError::config("the checksum asset is malformed"))?
         .to_ascii_lowercase();
     if checksum.len() != 64
         || !checksum
             .chars()
             .all(|character| character.is_ascii_hexdigit())
     {
-        anyhow::bail!("the checksum asset is malformed: expected a 64-character SHA-256 digest");
+        return Err(CliError::config(
+            "the checksum asset is malformed: expected a 64-character SHA-256 digest",
+        ));
     }
     Ok(checksum)
 }
@@ -490,26 +485,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn validate_binary(path: &Path, expected: &Version) -> Result<()> {
+fn validate_binary(path: &Path, expected: &Version) -> Result<(), CliError> {
     let output = Command::new(path)
         .arg("--version")
         .output()
-        .with_context(|| format!("failed to execute {}", path.display()))?;
+        .map_err(|error| {
+            CliError::config(format!("failed to execute {}: {error}", path.display()))
+        })?;
     if !output.status.success() {
-        anyhow::bail!(
+        return Err(CliError::config(format!(
             "the downloaded binary failed to run --version: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let reported = stdout
         .split_whitespace()
         .last()
-        .ok_or_else(|| anyhow::anyhow!("the downloaded binary printed no version"))?;
-    let reported = parse_tag_version(reported)
-        .with_context(|| format!("the downloaded binary reported an invalid version: {stdout}"))?;
+        .ok_or_else(|| CliError::config("the downloaded binary printed no version"))?;
+    let reported = parse_tag_version(reported)?;
     if &reported != expected {
-        anyhow::bail!("the downloaded binary reports {reported}, but the release is {expected}");
+        return Err(CliError::config(format!(
+            "the downloaded binary reports {reported}, but the release is {expected}"
+        )));
     }
     Ok(())
 }

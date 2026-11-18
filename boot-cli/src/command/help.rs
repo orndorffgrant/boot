@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use clap::CommandFactory;
 
-use crate::CLI;
+use crate::command::CLI;
 
 struct OverviewGroup {
     title: &'static str,
@@ -190,6 +190,8 @@ pub fn print_overview() -> Result<()> {
     println!("Options:");
     println!("  --cli-db <PATH>    Path to the CLI database");
     println!("  --api-db <PATH>    Path to the API database");
+    println!("  --dry-run          Show the plan without executing it");
+    println!("  -q, --quiet        Suppress progress and informational output");
     println!("  -h, --help         Print help");
     println!("  -V, --version      Print version");
     Ok(())

@@ -1,8 +1,12 @@
 # boot CLI Internal Architecture — Design
 
-Status: Draft for approval; review decisions incorporated  
-Date: 2026-11-18  
-Scope: `boot-cli`, with additions to `boot-protocol` and `boot-api`  
+Status: Implemented
+
+Date: 2026-11-18
+
+Implemented: 2026-11-18
+
+Scope: `boot-cli`, with additions to `boot-protocol` and `boot-api`
 Related: [cli-command-structure.md](cli-command-structure.md),
 [api-architecture-design.md](api-architecture-design.md),
 [rtt-artifact-decoding-design.md](rtt-artifact-decoding-design.md)
@@ -1431,7 +1435,7 @@ filter: probes | serial-ports | sessions(select) | tokens | servers
   no-op until the backend exists; the executor surfaces the API's current
   "not implemented" error.
 
-## 11. Proposed API changes
+## 11. API changes
 
 All four additions below are in scope for the single change set. The first two
 remove races and duplicated client policy; the other two improve robustness.
@@ -1450,7 +1454,7 @@ CLI lists active sessions
 Two clients can both see "not found" and race. `--follow` and `--new` also
 depend on the same list.
 
-Proposed request field on both session-creation endpoints:
+Request field on both session-creation endpoints:
 
 ```json
 {
@@ -1483,8 +1487,8 @@ Response:
 ```
 
 - The runtime makes the decision under the lease manager, not in the CLI.
-- `201` means created, `200` means attached. The body also says which happened
-  so clients do not have to infer from status.
+- Both cases return `200 OK`; the `created` flag says whether the session was
+  created or reused.
 - The CLI's `EnsureSession` action maps directly to this endpoint.
 
 ### 11.2 Server-side resource selector resolution
@@ -1494,15 +1498,15 @@ Current CLI matching rules are split between probes and serial ports:
 - probe ID, `vvvv:pppp:serial`, or probe name;
 - serial port ID or device path.
 
-Proposed endpoints:
+Endpoints:
 
 ```text
-GET /v1/probes/resolve?selector=<url-encoded>
-GET /v1/serial-ports/resolve?selector=<url-encoded>
+GET /v1/resolve/probe?selector=<url-encoded>
+GET /v1/resolve/serial-port?selector=<url-encoded>
 ```
 
-`resolve` is a reserved subpath. Resource IDs are prefixed (`probe_`, `port_`),
-so it cannot collide with a real ID. Responses: the resource DTO.
+These are top-level paths, so they do not collide with `/v1/probes/{id}` or
+`/v1/serial-ports/{id}`. Responses: the resource DTO.
 
 Errors:
 
@@ -1829,9 +1833,9 @@ choices:
 | Ctrl+C during change follow | Detach locally and leave the server change running; do not abort by default |
 | `--dry-run` scope | Support it on every command; simple commands show a one-task plan |
 
-### Approval requested
+### Implementation scope
 
-This document asks for approval of:
+This implementation covers:
 
 - the four-layer split and dependency direction;
 - the `CommandIntent` -> `Plan` -> `PlanExecutor` model;
@@ -1865,3 +1869,4 @@ decisions within the boundaries above.
 | 2026-11-18 | Review decision: defer terminal raw mode/PTY. |
 | 2026-11-18 | Review decision: Ctrl+C during change follow detaches without aborting. |
 | 2026-11-18 | Review decision: support `--dry-run` on all commands. |
+| 2026-11-18 | Implemented the single-change-set rewrite, including all four API additions. |

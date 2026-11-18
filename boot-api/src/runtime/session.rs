@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use boot_protocol::{RttRecord, Session, SessionData, SessionDecode, SessionPatch, Subscriber};
+use boot_protocol::{
+    RttRecord, Session, SessionAcquire, SessionAcquireResult, SessionData, SessionDecode,
+    SessionPatch, Subscriber,
+};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -479,6 +482,7 @@ impl Runtime {
         &self,
         resource_id: &str,
         kind: &str,
+        acquire: SessionAcquire,
         options: boot_protocol::SessionOptions,
         artifact_id: Option<&str>,
         inherit_artifact: bool,
@@ -486,7 +490,7 @@ impl Runtime {
         max_subscribers: u32,
         detach_timeout_seconds: u64,
         wait_ms: u64,
-    ) -> Result<Session, RuntimeError> {
+    ) -> Result<SessionAcquireResult, RuntimeError> {
         if kind != "rtt" && kind != "dap" {
             return Err(RuntimeError::new(
                 "invalid_request",
@@ -502,6 +506,7 @@ impl Runtime {
         self.create_session(
             resource_id,
             kind,
+            acquire,
             options,
             artifact_id,
             inherit_artifact,
@@ -516,15 +521,17 @@ impl Runtime {
     pub async fn create_serial_session(
         &self,
         resource_id: &str,
+        acquire: SessionAcquire,
         options: boot_protocol::SessionOptions,
         principal: &str,
         max_subscribers: u32,
         detach_timeout_seconds: u64,
         wait_ms: u64,
-    ) -> Result<Session, RuntimeError> {
+    ) -> Result<SessionAcquireResult, RuntimeError> {
         self.create_session(
             resource_id,
             "serial",
+            acquire,
             options,
             None,
             false,
@@ -541,6 +548,7 @@ impl Runtime {
         &self,
         resource_id: &str,
         kind: &str,
+        acquire: SessionAcquire,
         options: boot_protocol::SessionOptions,
         artifact_id: Option<&str>,
         inherit_artifact: bool,
@@ -548,7 +556,7 @@ impl Runtime {
         max_subscribers: u32,
         detach_timeout_seconds: u64,
         wait_ms: u64,
-    ) -> Result<Session, RuntimeError> {
+    ) -> Result<SessionAcquireResult, RuntimeError> {
         let resource = self.resource(resource_id).ok_or_else(|| {
             RuntimeError::not_found(format!("resource '{resource_id}' not found"))
         })?;
@@ -558,6 +566,26 @@ impl Runtime {
                 "session kind does not match resource",
             ));
         }
+        if let Some(existing) = self.active_session(resource_id, kind) {
+            return match acquire {
+                SessionAcquire::Create => Err(RuntimeError::new(
+                    "session_active",
+                    format!("resource already has an active session: {}", existing.id),
+                )),
+                SessionAcquire::Attach | SessionAcquire::AttachOrCreate => {
+                    Ok(SessionAcquireResult {
+                        session: existing,
+                        created: false,
+                    })
+                }
+            };
+        }
+        if acquire == SessionAcquire::Attach {
+            return Err(RuntimeError::new(
+                "session_not_found",
+                format!("no active {kind} session for '{resource_id}'"),
+            ));
+        }
         let (options, decode, profile) = if kind == "rtt" {
             self.resolve_rtt_artifact(resource_id, artifact_id, inherit_artifact, options)
                 .await?
@@ -565,13 +593,30 @@ impl Runtime {
             (options, SessionDecode::default(), None)
         };
         let id = new_id("ses");
-        let lease = lease::acquire(
+        let lease = match lease::acquire(
             &self.inner,
             resource_id,
             &id,
             Duration::from_millis(wait_ms.min(30_000)),
         )
-        .await?;
+        .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                if matches!(
+                    acquire,
+                    SessionAcquire::Attach | SessionAcquire::AttachOrCreate
+                ) {
+                    if let Some(existing) = self.active_session(resource_id, kind) {
+                        return Ok(SessionAcquireResult {
+                            session: existing,
+                            created: false,
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
         let now = now_rfc3339();
         let session = Session {
             id: id.clone(),
@@ -654,7 +699,18 @@ impl Runtime {
             resource.path,
             options,
         );
-        Ok(session)
+        Ok(SessionAcquireResult {
+            session,
+            created: true,
+        })
+    }
+
+    fn active_session(&self, resource_id: &str, kind: &str) -> Option<Session> {
+        self.sessions_list().into_iter().find(|session| {
+            session.resource_id == resource_id
+                && session.kind == kind
+                && matches!(session.state.as_str(), "starting" | "active" | "resuming")
+        })
     }
 
     async fn resolve_rtt_artifact(

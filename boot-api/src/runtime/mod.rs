@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use boot_protocol::ProbeArtifact;
+use boot_protocol::{Change, ProbeArtifact};
 use sha2::{Digest, Sha256};
 
 use crate::auth::StoreError;
@@ -101,6 +101,19 @@ impl From<StoreError> for RuntimeError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum IdempotencyEntry {
+    Pending {
+        request_hash: String,
+        created_at: i64,
+    },
+    Ready {
+        request_hash: String,
+        change_id: String,
+        created_at: i64,
+    },
+}
+
 pub struct RuntimeInner {
     pub store: Arc<Store>,
     pub config: RuntimeConfig,
@@ -111,6 +124,7 @@ pub struct RuntimeInner {
     pub sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     pub probe_artifacts: Mutex<HashMap<String, ProbeArtifact>>,
     pub decode_cache: Mutex<HashMap<String, Arc<decode::DecodeProfile>>>,
+    pub idempotency: Mutex<HashMap<(String, String), IdempotencyEntry>>,
     pub generation: AtomicU64,
 }
 
@@ -132,6 +146,7 @@ impl Runtime {
                 sessions: Mutex::new(HashMap::new()),
                 probe_artifacts: Mutex::new(HashMap::new()),
                 decode_cache: Mutex::new(HashMap::new()),
+                idempotency: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(1),
             }),
         }
@@ -198,12 +213,178 @@ impl Runtime {
             .cloned()
     }
 
+    pub fn resource_by_selector(
+        &self,
+        kind: ResourceKind,
+        selector: &str,
+    ) -> Result<ResourceEntry, RuntimeError> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(RuntimeError::new(
+                "invalid_selector",
+                "resource selector must not be empty",
+            ));
+        }
+        let resources = self.resources();
+        if let Some(resource) = resources
+            .iter()
+            .find(|resource| resource.kind == kind && resource.id == selector)
+        {
+            return Ok(resource.clone());
+        }
+        let matches: Vec<ResourceEntry> = resources
+            .into_iter()
+            .filter(|resource| resource.kind == kind && selector_matches(resource, selector))
+            .collect();
+        match matches.len() {
+            0 => Err(RuntimeError::not_found(format!(
+                "no {} matches '{}'",
+                resource_kind_name(kind),
+                selector
+            ))),
+            1 => Ok(matches.into_iter().next().expect("one match")),
+            _ => {
+                let candidates = matches
+                    .iter()
+                    .map(|resource| resource.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(RuntimeError::new(
+                    "ambiguous_selector",
+                    format!("selector '{selector}' matches multiple resources: {candidates}"),
+                ))
+            }
+        }
+    }
+
     pub fn probe_artifact(&self, resource_id: &str) -> Option<ProbeArtifact> {
         artifact::probe_artifact(&self.inner, resource_id)
     }
 
     pub async fn clear_probe_artifact(&self, resource_id: &str) -> Result<(), RuntimeError> {
         artifact::clear_probe_artifact(&self.inner, resource_id).await
+    }
+
+    pub fn idempotent_change(
+        &self,
+        principal: &str,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<Change>, RuntimeError> {
+        let lookup_key = (principal.to_string(), key.to_string());
+        let mut entries = self.inner.idempotency.lock().expect("idempotency lock");
+        let Some(entry) = entries.get(&lookup_key).cloned() else {
+            return Ok(None);
+        };
+        if now_unix().saturating_sub(entry_created_at(&entry)) > 24 * 60 * 60 {
+            entries.remove(&lookup_key);
+            return Ok(None);
+        }
+        match entry {
+            IdempotencyEntry::Pending { .. } => Err(RuntimeError {
+                code: "idempotency_in_progress",
+                message: "a request with this idempotency key is already in progress".to_string(),
+                retry_after_seconds: Some(1),
+            }),
+            IdempotencyEntry::Ready {
+                request_hash: stored,
+                change_id,
+                ..
+            } => {
+                if stored != request_hash {
+                    return Err(RuntimeError::new(
+                        "idempotency_conflict",
+                        "idempotency key was reused with a different request",
+                    ));
+                }
+                drop(entries);
+                match self.change_handle(&change_id) {
+                    Ok(handle) => Ok(Some(handle.snapshot())),
+                    Err(_) => {
+                        self.inner
+                            .idempotency
+                            .lock()
+                            .expect("idempotency lock")
+                            .remove(&lookup_key);
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn reserve_idempotency(
+        &self,
+        principal: &str,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<(), RuntimeError> {
+        let lookup_key = (principal.to_string(), key.to_string());
+        let mut entries = self.inner.idempotency.lock().expect("idempotency lock");
+        if let Some(entry) = entries.get(&lookup_key) {
+            if now_unix().saturating_sub(entry_created_at(entry)) <= 24 * 60 * 60 {
+                return Err(RuntimeError::new(
+                    "idempotency_in_progress",
+                    "a request with this idempotency key is already in progress",
+                ));
+            }
+        }
+        entries.insert(
+            lookup_key,
+            IdempotencyEntry::Pending {
+                request_hash: request_hash.to_string(),
+                created_at: now_unix(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn complete_idempotency(&self, principal: &str, key: &str, change_id: &str) {
+        let lookup_key = (principal.to_string(), key.to_string());
+        let mut entries = self.inner.idempotency.lock().expect("idempotency lock");
+        let request_hash = entries
+            .get(&lookup_key)
+            .map(|entry| match entry {
+                IdempotencyEntry::Pending { request_hash, .. }
+                | IdempotencyEntry::Ready { request_hash, .. } => request_hash.clone(),
+            })
+            .unwrap_or_default();
+        entries.insert(
+            lookup_key,
+            IdempotencyEntry::Ready {
+                request_hash,
+                change_id: change_id.to_string(),
+                created_at: now_unix(),
+            },
+        );
+    }
+
+    pub fn cancel_idempotency(&self, principal: &str, key: &str) {
+        self.inner
+            .idempotency
+            .lock()
+            .expect("idempotency lock")
+            .remove(&(principal.to_string(), key.to_string()));
+    }
+}
+
+fn entry_created_at(entry: &IdempotencyEntry) -> i64 {
+    match entry {
+        IdempotencyEntry::Pending { created_at, .. }
+        | IdempotencyEntry::Ready { created_at, .. } => *created_at,
+    }
+}
+
+fn selector_matches(resource: &ResourceEntry, selector: &str) -> bool {
+    resource.selector.as_deref() == Some(selector)
+        || resource.path.as_deref() == Some(selector)
+        || resource.name == selector
+}
+
+fn resource_kind_name(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Probe => "probe",
+        ResourceKind::SerialPort => "serial port",
     }
 }
 
@@ -248,4 +429,152 @@ pub fn stable_id(prefix: &str, identity: &str) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    async fn runtime(name: &str) -> (Runtime, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "boot-runtime-selector-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = Arc::new(Store::open(directory.join("boot.sqlite3")).await.unwrap());
+        (
+            Runtime::new(
+                store,
+                RuntimeConfig::new(directory.join("sessions"), directory.join("artifacts")),
+            ),
+            directory,
+        )
+    }
+
+    fn resource(
+        id: &str,
+        kind: ResourceKind,
+        name: &str,
+        selector: Option<&str>,
+        path: Option<&str>,
+    ) -> ResourceEntry {
+        ResourceEntry {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            selector: selector.map(str::to_string),
+            path: path.map(str::to_string),
+            generation: 1,
+            state: "present".to_string(),
+            identity_stable: true,
+            vendor_id: Some(1),
+            product_id: Some(2),
+            serial_number: Some("serial".to_string()),
+            probe_type: Some("probe".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_resources_by_id_selector_path_and_name() {
+        let (runtime, directory) = runtime("resolve").await;
+        runtime.inner.resources.lock().unwrap().insert(
+            "probe_1".to_string(),
+            resource(
+                "probe_1",
+                ResourceKind::Probe,
+                "probe one",
+                Some("0001:0002:serial"),
+                None,
+            ),
+        );
+        runtime.inner.resources.lock().unwrap().insert(
+            "port_1".to_string(),
+            resource(
+                "port_1",
+                ResourceKind::SerialPort,
+                "port one",
+                None,
+                Some("/dev/ttyACM0"),
+            ),
+        );
+
+        assert_eq!(
+            runtime
+                .resource_by_selector(ResourceKind::Probe, "probe_1")
+                .unwrap()
+                .id,
+            "probe_1"
+        );
+        assert_eq!(
+            runtime
+                .resource_by_selector(ResourceKind::Probe, "0001:0002:serial")
+                .unwrap()
+                .id,
+            "probe_1"
+        );
+        assert_eq!(
+            runtime
+                .resource_by_selector(ResourceKind::SerialPort, "/dev/ttyACM0")
+                .unwrap()
+                .id,
+            "port_1"
+        );
+        assert!(
+            runtime
+                .resource_by_selector(ResourceKind::Probe, "/dev/ttyACM0")
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn idempotency_reservations_and_conflicts_are_tracked() {
+        let (runtime, directory) = runtime("idempotency").await;
+        runtime
+            .reserve_idempotency("principal", "key", "hash")
+            .unwrap();
+        let error = runtime
+            .idempotent_change("principal", "key", "hash")
+            .unwrap_err();
+        assert_eq!(error.code, "idempotency_in_progress");
+        runtime.complete_idempotency("principal", "key", "chg_missing");
+        let error = runtime
+            .idempotent_change("principal", "key", "different")
+            .unwrap_err();
+        assert_eq!(error.code, "idempotency_conflict");
+        assert!(
+            runtime
+                .idempotent_change("principal", "key", "hash")
+                .unwrap()
+                .is_none()
+        );
+        runtime.cancel_idempotency("principal", "key");
+        assert!(
+            runtime
+                .idempotent_change("principal", "key", "hash")
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn rejects_ambiguous_selectors() {
+        let (runtime, directory) = runtime("ambiguous").await;
+        runtime.inner.resources.lock().unwrap().insert(
+            "probe_1".to_string(),
+            resource("probe_1", ResourceKind::Probe, "same", None, None),
+        );
+        runtime.inner.resources.lock().unwrap().insert(
+            "probe_2".to_string(),
+            resource("probe_2", ResourceKind::Probe, "same", None, None),
+        );
+        let error = runtime
+            .resource_by_selector(ResourceKind::Probe, "same")
+            .unwrap_err();
+        assert_eq!(error.code, "ambiguous_selector");
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

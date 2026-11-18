@@ -409,6 +409,7 @@ name = "boot-cli"
 version = "2026.1111.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.23.1",
  "boot-api",
  "boot-api-client",
@@ -417,7 +418,6 @@ dependencies = [
  "comfy-table",
  "directories",
  "futures",
- "hyper-util",
  "indicatif",
  "reqwest",
  "semver",
@@ -429,6 +429,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
 ]
 
 [[package]]

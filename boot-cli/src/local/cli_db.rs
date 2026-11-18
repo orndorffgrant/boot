@@ -23,12 +23,6 @@ pub struct ServerEntry {
     pub token: Option<String>,
 }
 
-impl ServerEntry {
-    pub fn tls(&self) -> bool {
-        self.url.starts_with("https://")
-    }
-}
-
 pub fn resolve_cli_db_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());

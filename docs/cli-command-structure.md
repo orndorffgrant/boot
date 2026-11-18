@@ -322,7 +322,7 @@ a server entry, in either mode.
 
 | Command | Purpose |
 | --- | --- |
-| `list-probes` | List available debug probes |
+| `list-probes` | List available debug probes (`--server` filters) |
 | `run-firmware` | Flash firmware and optionally attach |
 | `attach-probe` | Attach to RTT output |
 | `start-dap` | Start a DAP bridge for a probe |
@@ -331,14 +331,14 @@ a server entry, in either mode.
 
 | Command | Purpose |
 | --- | --- |
-| `list-serial-ports` | List available serial ports |
+| `list-serial-ports` | List available serial ports (`--server` filters) |
 | `attach-serial` | Attach to a serial session and open a shell |
 
 ### Sessions
 
 | Command | Purpose |
 | --- | --- |
-| `list-sessions` | List live and retained sessions |
+| `list-sessions` | List active sessions by default (`--active`, `--past`, `--all`) |
 | `replay-session` | Replay a retained session |
 | `export-session` | Export a retained session as asciicast v3 |
 
@@ -390,7 +390,7 @@ Serial ports
   attach-serial      Attach to a serial session and open a shell
 
 Sessions
-  list-sessions      List live and retained sessions
+  list-sessions      List active sessions (use --all for retained)
   replay-session     Replay a retained session
   export-session     Export a retained session as asciicast v3
 
@@ -570,20 +570,21 @@ The change touches `boot-cli/src/main.rs` and the command modules:
 
 ## Follow-ups
 
-These are related structural fixes that are not part of the rename:
+These were related structural fixes, now mostly addressed by the CLI
+architecture rewrite:
 
-- Add `--active`, `--past`, and `--all` to `list-sessions`. It currently always
-  requests `all`.
-- Add `--server <name>` filters to `list-probes`, `list-serial-ports`,
-  `list-sessions`, and `list-servers`.
-- Make `--session` mutually exclusive with `--follow` and `--new` in
-  `attach-probe` and `attach-serial`.
-- Make `--serial-shell` conflict with `--no-attach` in `run-firmware`.
-- Align `attach-serial` with the session design: `--follow` should attach
-  read-only by default, and `--write` should override it.
-- Implement or hide `start-dap`; it currently always fails with "DAP sessions
-  are not implemented yet".
-- Update the remaining documentation examples that still use the old names.
+- Done: `list-sessions` has `--active`, `--past`, and `--all`; it defaults to
+  active.
+- Done: `list-probes`, `list-serial-ports`, and `list-sessions` accept
+  `--server`.
+- Done: `--session` conflicts with `--follow` and `--new` in `attach-probe` and
+  `attach-serial`.
+- Done: `--serial-shell` conflicts with `--no-attach` in `run-firmware`.
+- Pending: `attach-serial --follow` still defaults to write access; a
+  `--write`/read-only policy pass is still open.
+- Decided: `start-dap` stays visible and returns the current not-implemented
+  error until the backend exists.
+- Pending: review remaining documentation examples that still use old names.
 
 ## Decision log
 

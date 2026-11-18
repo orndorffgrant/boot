@@ -69,6 +69,11 @@ pub struct ListQuery {
     pub select: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ResolveQuery {
+    pub selector: String,
+}
+
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct DeleteSessionQuery {
     #[serde(default)]
@@ -229,6 +234,16 @@ trait BootApi {
 
     #[endpoint {
         method = GET,
+        path = "/v1/resolve/probe",
+    }]
+    async fn resolve_probe(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        query: Query<ResolveQuery>,
+    ) -> Result<HttpResponseOk<Probe>, HttpError>;
+
+    #[endpoint {
+        method = GET,
         path = "/v1/serial-ports",
     }]
     async fn serial_ports(
@@ -244,6 +259,16 @@ trait BootApi {
         rqctx: RequestContext<Self::Context>,
         _auth: Auth<Read>,
         path: Path<IdPath>,
+    ) -> Result<HttpResponseOk<SerialPort>, HttpError>;
+
+    #[endpoint {
+        method = GET,
+        path = "/v1/resolve/serial-port",
+    }]
+    async fn resolve_serial_port(
+        rqctx: RequestContext<Self::Context>,
+        _auth: Auth<Read>,
+        query: Query<ResolveQuery>,
     ) -> Result<HttpResponseOk<SerialPort>, HttpError>;
 
     #[endpoint {
@@ -331,7 +356,7 @@ trait BootApi {
         _auth: Auth<Control>,
         path: Path<IdPath>,
         body: TypedBody<ProbeSessionRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError>;
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SessionAcquireResult>>, HttpError>;
 
     #[endpoint {
         method = PUT,
@@ -373,7 +398,7 @@ trait BootApi {
         _auth: Auth<Control>,
         path: Path<IdPath>,
         body: TypedBody<SerialSessionRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseCreated<Session>>, HttpError>;
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SessionAcquireResult>>, HttpError>;
 
     #[endpoint {
         method = GET,
@@ -643,6 +668,14 @@ mod tests {
         );
         assert_eq!(
             document["paths"]["/v1/probes"]["get"]["security"],
+            serde_json::json!([{ "bootAuth": [] }])
+        );
+        assert_eq!(
+            document["paths"]["/v1/resolve/probe"]["get"]["security"],
+            serde_json::json!([{ "bootAuth": [] }])
+        );
+        assert_eq!(
+            document["paths"]["/v1/resolve/serial-port"]["get"]["security"],
             serde_json::json!([{ "bootAuth": [] }])
         );
         assert!(document["paths"]["/v1/tokens"]["post"]["responses"]["401"].is_object());
