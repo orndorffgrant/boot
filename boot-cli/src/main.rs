@@ -6,6 +6,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 mod command;
+mod dap_bridge;
 mod domain;
 mod error;
 mod execute;

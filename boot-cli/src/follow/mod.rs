@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Reusable change and session following with cursor replay and reconnect.
 
+pub mod dap;
+
 use std::time::Duration;
 
 use boot_protocol::{

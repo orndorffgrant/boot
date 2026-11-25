@@ -284,6 +284,31 @@ impl<'a> Executor<'a> {
                 slots.insert(*out, SessionHandle { server, session });
                 Ok(Outcome::Done)
             }
+            Action::StartDapBridge {
+                server,
+                resource,
+                transport,
+                artifact,
+                inherit_artifact,
+            } => {
+                let server = slots.get(*server)?.clone();
+                let resource = slots.get(*resource)?.clone();
+                let artifact = artifact_id(slots, artifact)?;
+                self.ui
+                    .status(&format!("Starting DAP bridge for {}", resource.id));
+                crate::dap_bridge::run_bridge(
+                    self.ports,
+                    self.ui.clone(),
+                    self.cancel.clone(),
+                    server,
+                    resource.id,
+                    *transport,
+                    artifact,
+                    *inherit_artifact,
+                )
+                .await?;
+                Ok(Outcome::Streamed { summary: None })
+            }
             Action::AttachSession {
                 server,
                 resource,
@@ -1052,7 +1077,9 @@ impl<'a> Executor<'a> {
                         .await?
                 }
                 SessionKind::Dap => {
-                    return Err(CliError::config("DAP sessions are not implemented yet"));
+                    return Err(CliError::config(
+                        "DAP sessions must be started with `boot start-dap`",
+                    ));
                 }
             };
             if !result.created {
@@ -1097,6 +1124,22 @@ impl<'a> Executor<'a> {
         handle: SessionHandle,
         policy: &FollowSessionPolicy,
     ) -> Result<Outcome, CliError> {
+        if handle.session.kind == "dap" {
+            let after = match policy.cursor {
+                crate::domain::FollowCursor::Latest => None,
+                crate::domain::FollowCursor::Start => Some(0),
+                crate::domain::FollowCursor::After(value) => Some(value),
+            };
+            crate::follow::dap::replay(
+                self.ports,
+                self.ui.clone(),
+                handle.server,
+                handle.session,
+                after,
+            )
+            .await?;
+            return Ok(Outcome::Streamed { summary: None });
+        }
         let client = self.ports.api.client(&handle.server)?;
         let after = match policy.cursor {
             crate::domain::FollowCursor::Latest => None,

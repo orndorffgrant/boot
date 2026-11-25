@@ -5,6 +5,7 @@ members = [
     "boot-api",
     "boot-api-client",
     "boot-cli",
+    "boot-dap",
     "boot-protocol",
 ]
 
@@ -38,6 +39,7 @@ progenitor-client = "0.15"
 prettyplease = "0.3"
 probe-rs = "0.32"
 probe-rs-debug = "0.32"
+typed-path = "0.12"
 rand = "0.10"
 tokio-util = { version = "0.7", features = ["codec"] }
 schemafy = "0.6"
@@ -65,4 +67,5 @@ tokio-tungstenite = "0.30"
 # Workspace crates
 boot-api = { path = "boot-api", default-features = false }
 boot-api-client = { path = "boot-api-client" }
+boot-dap = { path = "boot-dap" }
 boot-protocol = { path = "boot-protocol" }

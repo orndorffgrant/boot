@@ -52,6 +52,11 @@ pub async fn create(inner: &RuntimeInner, bytes: &[u8]) -> Result<Artifact, Runt
         created_at,
     };
     inner.store.insert_artifact(&record).await?;
+    inner
+        .artifact_paths
+        .lock()
+        .expect("artifact path map")
+        .insert(id.clone(), path);
     Ok(Artifact {
         id,
         size: bytes.len() as u64,
@@ -67,7 +72,13 @@ pub async fn path(inner: &RuntimeInner, id: &str) -> Result<PathBuf, RuntimeErro
         .load_artifact(id)
         .await?
         .ok_or_else(|| RuntimeError::not_found(format!("artifact '{id}' not found")))?;
-    Ok(PathBuf::from(record.path))
+    let path = PathBuf::from(record.path);
+    inner
+        .artifact_paths
+        .lock()
+        .expect("artifact path map")
+        .insert(id.to_string(), path.clone());
+    Ok(path)
 }
 
 pub async fn get(inner: &RuntimeInner, id: &str) -> Result<Artifact, RuntimeError> {
@@ -96,6 +107,11 @@ pub async fn delete(inner: &RuntimeInner, id: &str) -> Result<(), RuntimeError> 
     if let Some(record) = inner.store.load_artifact(id).await? {
         let _ = fs::remove_file(&record.path);
         inner.store.delete_artifact(id).await?;
+        inner
+            .artifact_paths
+            .lock()
+            .expect("artifact path map")
+            .remove(id);
     }
     Ok(())
 }

@@ -295,7 +295,10 @@ pub enum CommandIntent {
     AttachProbe(AttachProbeIntent),
     StartDap {
         target: ResourceSelector,
-        port: u16,
+        port: Option<u16>,
+        stdio: bool,
+        artifact: ArtifactSource,
+        inherit_artifact: bool,
     },
     ListSerialPorts {
         server: Option<String>,

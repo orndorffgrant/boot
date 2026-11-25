@@ -494,8 +494,9 @@ pub enum SessionWsMessage {
 
 /// One binary session data frame.
 ///
-/// Layout: `u64` big-endian sequence, an optional channel byte for RTT, then
-/// the payload bytes.
+/// Layout: `u64` big-endian sequence, an optional channel/direction byte for
+/// RTT/DAP, then the payload bytes. For DAP the byte is the direction:
+/// 0 = adapter-to-client, 1 = client-to-adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDataFrame<'a> {
     pub seq: u64,
@@ -520,7 +521,7 @@ pub fn decode_session_frame<'a>(
     kind: &str,
     bytes: &'a [u8],
 ) -> Result<SessionDataFrame<'a>, SessionFrameError> {
-    let channel_bytes = usize::from(kind == "rtt");
+    let channel_bytes = usize::from(kind == "rtt" || kind == "dap");
     if bytes.len() < 8 + channel_bytes {
         return Err(SessionFrameError::TooShort);
     }
@@ -540,7 +541,7 @@ pub fn decode_session_frame<'a>(
 pub fn encode_session_frame(kind: &str, seq: u64, channel: u8, data: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(9 + data.len());
     frame.extend_from_slice(&seq.to_be_bytes());
-    if kind == "rtt" {
+    if kind == "rtt" || kind == "dap" {
         frame.push(channel);
     }
     frame.extend_from_slice(data);
@@ -619,6 +620,13 @@ mod tests {
         assert_eq!(frame.seq, 9);
         assert_eq!(frame.channel, None);
         assert_eq!(frame.data, b"world");
+
+        let dap = encode_session_frame("dap", 11, 1, b"request");
+        assert_eq!(&dap[8..9], &[1]);
+        let frame = decode_session_frame("dap", &dap).unwrap();
+        assert_eq!(frame.seq, 11);
+        assert_eq!(frame.channel, Some(1));
+        assert_eq!(frame.data, b"request");
     }
 
     #[test]

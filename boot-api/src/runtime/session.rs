@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,8 +10,13 @@ use boot_protocol::{
     RttRecord, Session, SessionAcquire, SessionAcquireResult, SessionData, SessionDecode,
     SessionPatch, Subscriber,
 };
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "run")]
+use crate::runtime::RuntimeArtifactResolver;
+#[cfg(feature = "run")]
+use boot_dap::{DapBackend, DapIo, DapLaunch, NativeDapBackend};
 
 use crate::runtime::decode::{self, DecodeProfile, DecodeState};
 use crate::runtime::lease::LeaseGuard;
@@ -140,6 +146,9 @@ pub struct SessionHandle {
     pub subscriber_changed: Notify,
     pub subscribers: Mutex<Vec<Subscriber>>,
     pub input_tx: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    pub dap_input_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
+    pub dap_output_tx: Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>,
+    pub dap_output_rx: Mutex<Option<mpsc::Receiver<(u64, Vec<u8>)>>>,
     pub lease: Mutex<Option<LeaseGuard>>,
     pub shutdown: CancellationToken,
     pub log: Mutex<Option<SessionLogWriter>>,
@@ -167,6 +176,9 @@ impl SessionHandle {
             subscriber_changed: Notify::new(),
             subscribers: Mutex::new(Vec::new()),
             input_tx: Mutex::new(None),
+            dap_input_tx: Mutex::new(None),
+            dap_output_tx: Mutex::new(None),
+            dap_output_rx: Mutex::new(None),
             lease: Mutex::new(None),
             shutdown: CancellationToken::new(),
             log: Mutex::new(None),
@@ -329,6 +341,56 @@ impl SessionHandle {
                 channel: 0,
                 payload: data.to_vec(),
             });
+        }
+    }
+
+    fn next_dap_seq(&self) -> u64 {
+        let mut ring = self.ring.lock().expect("session ring");
+        ring.latest_seq += 1;
+        ring.latest_seq
+    }
+
+    pub fn push_dap_output(&self, data: Vec<u8>) {
+        let seq = self.next_dap_seq();
+        let timestamp_ms = now_unix() as u64 * 1000;
+        if let Some(log) = self.log.lock().expect("session log").as_mut() {
+            let _ = log.append(&LogRecord {
+                seq,
+                timestamp_ms,
+                kind: RECORD_OUTPUT,
+                channel: 0,
+                payload: data.clone(),
+            });
+        }
+        {
+            let mut session = self.state.lock().expect("session state");
+            session.data.latest_seq = seq;
+            session.data.bytes += data.len() as u64;
+        }
+        if let Some(tx) = self.dap_output_tx.lock().expect("dap output").as_ref() {
+            let _ = tx.try_send((seq, data));
+        }
+    }
+
+    pub fn push_dap_input(&self, data: Vec<u8>) {
+        let seq = self.next_dap_seq();
+        let timestamp_ms = now_unix() as u64 * 1000;
+        if let Some(log) = self.log.lock().expect("session log").as_mut() {
+            let _ = log.append(&LogRecord {
+                seq,
+                timestamp_ms,
+                kind: RECORD_INPUT,
+                channel: 1,
+                payload: data.clone(),
+            });
+        }
+        {
+            let mut session = self.state.lock().expect("session state");
+            session.data.latest_seq = seq;
+            session.data.bytes += data.len() as u64;
+        }
+        if let Some(tx) = self.dap_input_tx.lock().expect("dap input").as_ref() {
+            let _ = tx.try_send(data);
         }
     }
 
@@ -497,10 +559,10 @@ impl Runtime {
                 "probe session kind must be rtt or dap",
             ));
         }
-        if kind == "dap" {
+        if kind == "dap" && max_subscribers != 1 {
             return Err(RuntimeError::new(
                 "invalid_request",
-                "DAP is not implemented",
+                "DAP sessions require max_subscribers = 1",
             ));
         }
         self.create_session(
@@ -586,11 +648,18 @@ impl Runtime {
                 format!("no active {kind} session for '{resource_id}'"),
             ));
         }
-        let (options, decode, profile) = if kind == "rtt" {
-            self.resolve_rtt_artifact(resource_id, artifact_id, inherit_artifact, options)
-                .await?
+        let (options, decode, profile, dap_program) = if kind == "rtt" {
+            let (options, decode, profile) = self
+                .resolve_rtt_artifact(resource_id, artifact_id, inherit_artifact, options)
+                .await?;
+            (options, decode, profile, None)
+        } else if kind == "dap" {
+            let (decode, program) = self
+                .resolve_dap_artifact(resource_id, artifact_id, inherit_artifact)
+                .await?;
+            (options, decode, None, program)
         } else {
-            (options, SessionDecode::default(), None)
+            (options, SessionDecode::default(), None, None)
         };
         let id = new_id("ses");
         let lease = match lease::acquire(
@@ -628,8 +697,16 @@ impl Runtime {
             updated_at: now,
             closed_at: None,
             subscribers: 0,
-            max_subscribers: max_subscribers.min(32),
-            detach_timeout_seconds: detach_timeout_seconds.min(300),
+            max_subscribers: if kind == "dap" {
+                1
+            } else {
+                max_subscribers.min(32)
+            },
+            detach_timeout_seconds: if kind == "dap" {
+                0
+            } else {
+                detach_timeout_seconds.min(300)
+            },
             resume_count: 0,
             replayable: true,
             data: SessionData::default(),
@@ -698,6 +775,7 @@ impl Runtime {
             resource.selector,
             resource.path,
             options,
+            dap_program,
         );
         Ok(SessionAcquireResult {
             session,
@@ -790,6 +868,41 @@ impl Runtime {
             rtt_addr_source,
         };
         Ok((options, decode, Some(profile)))
+    }
+
+    async fn resolve_dap_artifact(
+        &self,
+        resource_id: &str,
+        explicit_artifact: Option<&str>,
+        inherit_artifact: bool,
+    ) -> Result<(SessionDecode, Option<PathBuf>), RuntimeError> {
+        let artifact_id = if let Some(id) = explicit_artifact {
+            Some(id.to_string())
+        } else if inherit_artifact {
+            self.probe_artifact(resource_id).map(|artifact| artifact.id)
+        } else {
+            None
+        };
+        let Some(artifact_id) = artifact_id else {
+            return Ok((SessionDecode::default(), None));
+        };
+        let path = crate::runtime::artifact::path(&self.inner, &artifact_id).await?;
+        let artifact = crate::runtime::artifact::get(&self.inner, &artifact_id).await?;
+        let decode = SessionDecode {
+            mode: "raw".to_string(),
+            epoch: 0,
+            artifact: Some(boot_protocol::SessionArtifact {
+                id: artifact.id,
+                size: artifact.size,
+                sha256: artifact.sha256,
+                created_at: artifact.created_at,
+                defmt: false,
+                rtt_addr: None,
+            }),
+            rtt_addr: None,
+            rtt_addr_source: "scan".to_string(),
+        };
+        Ok((decode, Some(path)))
     }
 
     pub fn session_handle(&self, id: &str) -> Result<Arc<SessionHandle>, RuntimeError> {
@@ -1051,6 +1164,7 @@ impl Runtime {
             resource.selector,
             resource.path,
             options,
+            None,
         );
         Ok(session)
     }
@@ -1157,7 +1271,11 @@ pub fn schedule_close_if_idle(inner: Arc<RuntimeInner>, handle: Arc<SessionHandl
 
 async fn fail_session(inner: &RuntimeInner, handle: &SessionHandle, error: String) {
     let mut session = handle.snapshot();
-    session.state = "suspended".to_string();
+    session.state = if session.kind == "dap" {
+        "failed".to_string()
+    } else {
+        "suspended".to_string()
+    };
     session.last_error = Some(error);
     session.updated_at = now_rfc3339();
     handle.update(session.clone());
@@ -1167,12 +1285,32 @@ async fn fail_session(inner: &RuntimeInner, handle: &SessionHandle, error: Strin
     handle.shutdown.cancel();
 }
 
+pub async fn close_dap_session(
+    inner: &Arc<RuntimeInner>,
+    handle: &Arc<SessionHandle>,
+) -> Result<(), RuntimeError> {
+    handle.shutdown.cancel();
+    let mut session = handle.snapshot();
+    session.state = "closed".to_string();
+    session.closed_at = Some(now_rfc3339());
+    session.updated_at = now_rfc3339();
+    handle.set_decoder(None, session.decode.epoch);
+    handle.update(session.clone());
+    let _ = handle.lease.lock().expect("lease").take();
+    let _ = inner
+        .store
+        .remove_artifact_refs_for_owner("session", &session.id)
+        .await;
+    persist_session_record(inner, &session, &handle.options_json).await
+}
+
 fn spawn_session_thread(
     inner: Arc<RuntimeInner>,
     handle: Arc<SessionHandle>,
     selector: Option<String>,
     path: Option<String>,
     options: boot_protocol::SessionOptions,
+    dap_program: Option<PathBuf>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEvent>();
     let shutdown = handle.shutdown.clone();
@@ -1205,6 +1343,89 @@ fn spawn_session_thread(
             .name(format!("boot-rtt-{}", handle.id))
             .spawn(move || rtt_thread(selector, options, event_tx, shutdown))
             .ok();
+    } else if kind == "dap" {
+        #[cfg(feature = "run")]
+        {
+            let Some(selector) = selector else {
+                let handle = handle.clone();
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    fail_session(&inner, &handle, "probe selector missing".into()).await;
+                });
+                return;
+            };
+            let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+            let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(256);
+            let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+            *handle.dap_input_tx.lock().expect("dap input") = Some(input_tx);
+            *handle.dap_output_tx.lock().expect("dap output") = Some(subscriber_tx);
+            *handle.dap_output_rx.lock().expect("dap output") = Some(subscriber_rx);
+            let resolver = std::sync::Arc::new(RuntimeArtifactResolver {
+                inner: inner.clone(),
+            });
+            let thread_event_tx = event_tx.clone();
+            let thread_handle = handle.clone();
+            let thread_shutdown = shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("boot-dap-{}", handle.id))
+                .stack_size(4 * 1024 * 1024)
+                .spawn(move || {
+                    let _ = thread_event_tx.send(ThreadEvent::Active);
+                    let mut backend = NativeDapBackend;
+                    let result = backend.run(
+                        DapIo {
+                            input: input_rx,
+                            output: worker_tx,
+                        },
+                        DapLaunch {
+                            probe_selector: selector,
+                            program_override: dap_program,
+                            artifacts: resolver,
+                        },
+                        thread_shutdown,
+                    );
+                    match result {
+                        Ok(()) => {
+                            let _ = thread_event_tx.send(ThreadEvent::Ended);
+                        }
+                        Err(error) => {
+                            let _ = thread_event_tx.send(ThreadEvent::Error(error.to_string()));
+                        }
+                    }
+                    drop(thread_handle);
+                })
+                .ok();
+
+            let inner_for_task = inner.clone();
+            let handle_for_task = handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        data = worker_rx.recv() => {
+                            if let Some(data) = data {
+                                handle_for_task.push_dap_output(data);
+                            }
+                        }
+                        event = event_rx.recv() => {
+                            let Some(event) = event else { break };
+                            if !process_thread_event(&inner_for_task, &handle_for_task, event).await {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
+        #[cfg(not(feature = "run"))]
+        {
+            let handle = handle.clone();
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                fail_session(&inner, &handle, "DAP support is not compiled in".into()).await;
+            });
+            return;
+        }
     } else {
         let handle = handle.clone();
         let inner = inner.clone();
@@ -1218,52 +1439,54 @@ fn spawn_session_thread(
     let handle_for_task = handle.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            match event {
-                ThreadEvent::Active => {
-                    let mut session = handle_for_task.snapshot();
-                    session.state = "active".to_string();
-                    session.updated_at = now_rfc3339();
-                    handle_for_task.update(session.clone());
-                    let _ = persist_session_record(
-                        &inner_for_task,
-                        &session,
-                        &handle_for_task.options_json,
-                    )
-                    .await;
-                    if session.subscribers == 0 {
-                        schedule_close_if_idle(inner_for_task.clone(), handle_for_task.clone());
-                    }
-                }
-                ThreadEvent::Data { data, channel } => {
-                    handle_for_task.push_output(&inner_for_task, data, channel);
-                }
-                ThreadEvent::Error(error) => {
-                    fail_session(&inner_for_task, &handle_for_task, error).await;
-                    break;
-                }
-                ThreadEvent::Ended => {
-                    let mut session = handle_for_task.snapshot();
-                    session.state = "closed".to_string();
-                    session.closed_at = Some(now_rfc3339());
-                    session.updated_at = now_rfc3339();
-                    handle_for_task.set_decoder(None, session.decode.epoch);
-                    handle_for_task.update(session.clone());
-                    let _ = handle_for_task.lease.lock().expect("lease").take();
-                    let _ = inner_for_task
-                        .store
-                        .remove_artifact_refs_for_owner("session", &session.id)
-                        .await;
-                    let _ = persist_session_record(
-                        &inner_for_task,
-                        &session,
-                        &handle_for_task.options_json,
-                    )
-                    .await;
-                    break;
-                }
+            if !process_thread_event(&inner_for_task, &handle_for_task, event).await {
+                break;
             }
         }
     });
+}
+
+async fn process_thread_event(
+    inner: &Arc<RuntimeInner>,
+    handle: &Arc<SessionHandle>,
+    event: ThreadEvent,
+) -> bool {
+    match event {
+        ThreadEvent::Active => {
+            let mut session = handle.snapshot();
+            session.state = "active".to_string();
+            session.updated_at = now_rfc3339();
+            handle.update(session.clone());
+            let _ = persist_session_record(inner, &session, &handle.options_json).await;
+            if session.subscribers == 0 && session.kind != "dap" {
+                schedule_close_if_idle(inner.clone(), handle.clone());
+            }
+            true
+        }
+        ThreadEvent::Data { data, channel } => {
+            handle.push_output(inner, data, channel);
+            true
+        }
+        ThreadEvent::Error(error) => {
+            fail_session(inner, handle, error).await;
+            false
+        }
+        ThreadEvent::Ended => {
+            let mut session = handle.snapshot();
+            session.state = "closed".to_string();
+            session.closed_at = Some(now_rfc3339());
+            session.updated_at = now_rfc3339();
+            handle.set_decoder(None, session.decode.epoch);
+            handle.update(session.clone());
+            let _ = handle.lease.lock().expect("lease").take();
+            let _ = inner
+                .store
+                .remove_artifact_refs_for_owner("session", &session.id)
+                .await;
+            let _ = persist_session_record(inner, &session, &handle.options_json).await;
+            false
+        }
+    }
 }
 
 fn serial_thread(
@@ -1504,6 +1727,45 @@ mod tests {
             .unwrap();
         assert!(profile.is_none());
         assert!(decode.artifact.is_none());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn dap_output_and_input_are_logged_for_replay() {
+        let directory = std::env::temp_dir().join(format!(
+            "boot-api-session-dap-log-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let session = Session {
+            id: "ses_dap".into(),
+            kind: "dap".into(),
+            resource_id: "probe_test".into(),
+            created_by: "principal".into(),
+            state: "active".into(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            closed_at: None,
+            subscribers: 0,
+            max_subscribers: 1,
+            detach_timeout_seconds: 0,
+            resume_count: 0,
+            replayable: true,
+            data: SessionData::default(),
+            decode: SessionDecode::default(),
+            last_error: None,
+        };
+        let handle = SessionHandle::new(session, directory.clone(), "{}".into());
+        let writer = SessionLogWriter::open(&directory, "ses_dap").unwrap();
+        *handle.log.lock().expect("log") = Some(writer);
+        handle.push_dap_input(b"request".to_vec());
+        handle.push_dap_output(b"response".to_vec());
+        let events = handle.replay(0, true);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].data, SessionEventData::Input(ref data) if data == b"request"));
+        assert!(matches!(events[1].data, SessionEventData::Bytes(ref data) if data == b"response"));
+        assert_eq!(handle.snapshot().data.bytes, 15);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

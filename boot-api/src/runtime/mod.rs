@@ -26,6 +26,24 @@ pub use change::ChangeHandle;
 pub use inventory::{ResourceEntry, ResourceKind};
 pub use session::SessionHandle;
 
+#[cfg(feature = "run")]
+pub struct RuntimeArtifactResolver {
+    pub inner: Arc<RuntimeInner>,
+}
+
+#[cfg(feature = "run")]
+impl boot_dap::DapArtifactResolver for RuntimeArtifactResolver {
+    fn resolve(&self, artifact_id: &str) -> Result<PathBuf, boot_dap::DapError> {
+        self.inner
+            .artifact_paths
+            .lock()
+            .expect("artifact path map")
+            .get(artifact_id)
+            .cloned()
+            .ok_or_else(|| boot_dap::DapError::Artifact(artifact_id.to_string()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub session_dir: PathBuf,
@@ -123,6 +141,7 @@ pub struct RuntimeInner {
     pub changes: Mutex<HashMap<String, Arc<ChangeHandle>>>,
     pub sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     pub probe_artifacts: Mutex<HashMap<String, ProbeArtifact>>,
+    pub artifact_paths: Mutex<HashMap<String, PathBuf>>,
     pub decode_cache: Mutex<HashMap<String, Arc<decode::DecodeProfile>>>,
     pub idempotency: Mutex<HashMap<(String, String), IdempotencyEntry>>,
     pub generation: AtomicU64,
@@ -145,6 +164,7 @@ impl Runtime {
                 changes: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 probe_artifacts: Mutex::new(HashMap::new()),
+                artifact_paths: Mutex::new(HashMap::new()),
                 decode_cache: Mutex::new(HashMap::new()),
                 idempotency: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(1),

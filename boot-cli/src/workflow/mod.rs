@@ -9,8 +9,8 @@ use crate::domain::{
 };
 use crate::error::CliError;
 use crate::plan::{
-    Action, ArtifactRef, ChangeKind, CollectRequest, Plan, PlanBuilder, ProgressMode, ResourceKind,
-    ServiceAction, TokenChange,
+    Action, ArtifactRef, ChangeKind, CollectRequest, DapTransport, Plan, PlanBuilder, ProgressMode,
+    ResourceKind, ServiceAction, TokenChange,
 };
 
 pub fn plan(intent: CommandIntent) -> Result<Plan, CliError> {
@@ -47,7 +47,24 @@ pub fn plan(intent: CommandIntent) -> Result<Plan, CliError> {
         )),
         CommandIntent::RunFirmware(intent) => Ok(run_firmware(intent)),
         CommandIntent::AttachProbe(intent) => Ok(attach_probe(intent)),
-        CommandIntent::StartDap { target, port } => Ok(start_dap(target, port)),
+        CommandIntent::StartDap {
+            target,
+            port,
+            stdio,
+            artifact,
+            inherit_artifact,
+        } => Ok(start_dap(
+            target,
+            if stdio {
+                DapTransport::Stdio
+            } else {
+                DapTransport::Tcp {
+                    port: port.unwrap_or(50000),
+                }
+            },
+            artifact,
+            inherit_artifact,
+        )),
         CommandIntent::ListSerialPorts { server } => Ok(collect_plan(
             "list serial ports",
             CollectRequest::SerialPorts { server },
@@ -446,8 +463,13 @@ fn attach_probe(intent: crate::domain::AttachProbeIntent) -> Plan {
     builder.finish()
 }
 
-fn start_dap(target: crate::domain::ResourceSelector, _port: u16) -> Plan {
-    let mut builder = PlanBuilder::new("start a DAP session");
+fn start_dap(
+    target: crate::domain::ResourceSelector,
+    transport: DapTransport,
+    artifact: ArtifactSource,
+    inherit_artifact: bool,
+) -> Plan {
+    let mut builder = PlanBuilder::new("start a DAP bridge");
     let server = builder.slot();
     builder.push_hidden(
         "Load server",
@@ -468,24 +490,28 @@ fn start_dap(target: crate::domain::ResourceSelector, _port: u16) -> Plan {
         },
         ProgressMode::None,
     );
+    let artifact = match artifact {
+        ArtifactSource::Upload(path) => {
+            let out = builder.slot();
+            builder.push(
+                "Upload debug program",
+                Action::UploadArtifact { server, path, out },
+                ProgressMode::Bar(crate::plan::Unit::Bytes),
+            );
+            ArtifactRef::Uploaded(out)
+        }
+        ArtifactSource::Existing(id) => ArtifactRef::Id(id),
+        ArtifactSource::Inherit => ArtifactRef::Inherit,
+        ArtifactSource::Clear => ArtifactRef::None,
+    };
     builder.push(
-        "Start DAP session",
-        Action::AttachSession {
+        "Run DAP bridge",
+        Action::StartDapBridge {
             server,
-            resource: Some(probe),
-            kind: SessionKind::Dap,
-            acquire: SessionAcquire::AttachOrCreate,
-            explicit_session: None,
-            artifact: ArtifactRef::None,
-            baud_rate: None,
-            policy: follow_policy(
-                FollowCursor::Latest,
-                SessionAccess::Write,
-                false,
-                false,
-                crate::plan::ReconnectMode::Bounded(0),
-                false,
-            ),
+            resource: probe,
+            transport,
+            artifact,
+            inherit_artifact,
         },
         ProgressMode::Stream,
     );
@@ -701,6 +727,34 @@ mod tests {
             }
         ));
         assert_eq!(plan.tasks.last().unwrap().progress, ProgressMode::Stream);
+    }
+
+    #[test]
+    fn start_dap_stdio_plans_upload_and_bridge() {
+        let plan = plan(crate::domain::CommandIntent::StartDap {
+            target: resource("local/probe"),
+            port: None,
+            stdio: true,
+            artifact: ArtifactSource::Upload("firmware.elf".into()),
+            inherit_artifact: false,
+        })
+        .unwrap();
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| matches!(task.action, Action::UploadArtifact { .. }))
+        );
+        match &plan.tasks.last().unwrap().action {
+            Action::StartDapBridge {
+                transport,
+                artifact,
+                ..
+            } => {
+                assert_eq!(*transport, crate::plan::DapTransport::Stdio);
+                assert!(matches!(artifact, ArtifactRef::Uploaded(_)));
+            }
+            other => panic!("expected DAP bridge task, got {other:?}"),
+        }
     }
 
     #[test]

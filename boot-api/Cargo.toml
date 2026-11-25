@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 boot-protocol.workspace = true
+boot-dap = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 defmt-decoder = { workspace = true, optional = true }
 defmt-parser = { workspace = true, optional = true }
@@ -51,4 +52,4 @@ http-body-util.workspace = true
 
 [features]
 default = ["run"]
-run = ["probe-rs", "probe-rs-debug", "serialport", "tokio-tungstenite", "tokio-util", "schemafy", "addr2line", "capstone", "svd-parser", "os_pipe", "rand", "sqlx", "time", "tracing", "clap", "thiserror", "defmt-decoder", "defmt-parser", "object"]
+run = ["probe-rs", "probe-rs-debug", "boot-dap", "serialport", "tokio-tungstenite", "tokio-util", "schemafy", "addr2line", "capstone", "svd-parser", "os_pipe", "rand", "sqlx", "time", "tracing", "clap", "thiserror", "defmt-decoder", "defmt-parser", "object"]

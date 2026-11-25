@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Capability ports and their real API/local/OS adapters.
 
+pub mod dap;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +110,7 @@ pub trait Api: Send + Sync {
         select: &str,
     ) -> Result<Vec<Session>, CliError>;
     async fn get_session(&self, server: &ServerConfig, id: &str) -> Result<Session, CliError>;
+    async fn close_session(&self, server: &ServerConfig, id: &str) -> Result<(), CliError>;
     async fn upload_artifact(
         &self,
         server: &ServerConfig,
@@ -415,6 +418,14 @@ impl Api for RealApi {
             .map_err(|error| map_client_error(&server.name, error))?
             .into_inner();
         convert(session)
+    }
+
+    async fn close_session(&self, server: &ServerConfig, id: &str) -> Result<(), CliError> {
+        self.client(server)?
+            .delete_session(id, Some(false))
+            .await
+            .map_err(|error| map_client_error(&server.name, error))?;
+        Ok(())
     }
 
     async fn upload_artifact(

@@ -774,20 +774,63 @@ impl BootApi for ServerImpl {
         upgraded: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let runtime = runtime(&rqctx)?.clone();
+        let auth_state = rqctx.context().clone();
         let id = path.into_inner().id;
         let query = query.into_inner();
         let handle = match runtime.session_handle(&id) {
             Ok(handle) => handle,
             Err(error) => return Err(map_error(error)),
         };
-        let principal = auth.principal().id.clone();
+        let principal = auth.principal().clone();
+        let principal_id = principal.id.clone();
         let mode = query.mode.clone().unwrap_or_else(|| "write".to_string());
-        let subscriber = match handle.attach(&principal, &mode) {
+        let session = handle.snapshot();
+        let dap_terminal = session.kind == "dap"
+            && matches!(session.state.as_str(), "closed" | "failed" | "suspended");
+        if session.kind == "dap" {
+            if dap_terminal && mode != "read" {
+                return Err(HttpError::for_bad_request(
+                    None,
+                    "closed DAP sessions can only be replayed in read mode".to_string(),
+                ));
+            }
+            if !dap_terminal && mode != "write" {
+                return Err(HttpError::for_bad_request(
+                    None,
+                    "live DAP sessions require write mode".to_string(),
+                ));
+            }
+        }
+        let subscriber = match handle.attach(&principal_id, &mode) {
             Ok(subscriber) => subscriber,
+            Err(error) if session.kind == "dap" && error.code == "too_many_subscribers" => {
+                return Err(map_error(runtime::RuntimeError::new(
+                    "dap_exclusive",
+                    "DAP sessions allow exactly one live debugger",
+                )));
+            }
             Err(error) => return Err(map_error(error)),
         };
+        let is_dap = session.kind == "dap";
         upgraded.handle(move |ws_stream| async move {
-            session_io_ws(ws_stream, runtime.inner.clone(), handle, subscriber, query).await
+            if is_dap {
+                if dap_terminal {
+                    dap_replay_ws(ws_stream, handle, subscriber, query).await
+                } else {
+                    dap_session_io_ws(
+                        ws_stream,
+                        runtime.inner.clone(),
+                        auth_state,
+                        principal,
+                        handle,
+                        subscriber,
+                        query,
+                    )
+                    .await
+                }
+            } else {
+                session_io_ws(ws_stream, runtime.inner.clone(), handle, subscriber, query).await
+            }
         })
     }
 
@@ -1355,6 +1398,177 @@ async fn session_io_ws(
     }
     handle.detach(&subscriber.id);
     session::schedule_close_if_idle(inner.clone(), handle.clone());
+    Ok(())
+}
+
+async fn dap_session_io_ws(
+    ws_stream: dropshot::WebsocketConnection,
+    inner: Arc<runtime::RuntimeInner>,
+    auth_state: crate::auth::AuthState,
+    principal: crate::auth::Principal,
+    handle: Arc<runtime::SessionHandle>,
+    subscriber: Subscriber,
+    query: IoQuery,
+) -> WsResult {
+    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        ws_stream.into_inner(),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let (mut tx, mut rx) = ws_stream.split();
+    let snapshot = handle.snapshot();
+    let hello = SessionWsMessage::Hello {
+        v: PROTOCOL_VERSION,
+        protocol: PROTOCOL_VERSION,
+        subscriber_id: subscriber.id.clone(),
+        mode: subscriber.mode.clone(),
+        session: snapshot.clone(),
+        data_seq: snapshot.data.latest_seq,
+        oldest_seq: snapshot.data.oldest_seq,
+        latest_seq: snapshot.data.latest_seq,
+    };
+    send_json(&mut tx, &hello).await?;
+    let _ = query;
+
+    let Some(mut dap_output) = handle.dap_output_rx.lock().expect("dap output").take() else {
+        let _ = session::close_dap_session(&inner, &handle).await;
+        handle.detach(&subscriber.id);
+        return Ok(());
+    };
+    let mut lifecycle = handle.lifecycle_tx.subscribe();
+    let mut revalidate = tokio::time::interval(std::time::Duration::from_secs(30));
+    revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = revalidate.tick() => {
+                if !auth_state
+                    .is_authorized(&principal, crate::auth::Capability::Control)
+                    .await
+                {
+                    let _ = send_json(&mut tx, &SessionWsMessage::Error {
+                        code: "unauthorized".into(),
+                        message: "token was revoked or expired".into(),
+                    }).await;
+                    break;
+                }
+            }
+            data = dap_output.recv() => {
+                match data {
+                    Some((seq, data)) => {
+                        send_binary(&mut tx, "dap", seq, 0, &data).await?;
+                    }
+                    None => break,
+                }
+            }
+            event = lifecycle.recv() => {
+                match event {
+                    Ok(session) => {
+                        match session.state.as_str() {
+                            "active" => {
+                                send_json(&mut tx, &SessionWsMessage::Active { session }).await?;
+                            }
+                            "closed" => {
+                                send_json(&mut tx, &SessionWsMessage::Ended { session }).await?;
+                                break;
+                            }
+                            "failed" => {
+                                send_json(
+                                    &mut tx,
+                                    &SessionWsMessage::Failed {
+                                        session,
+                                        error: "session failed".into(),
+                                    },
+                                )
+                                .await?;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = rx.next() => {
+                match incoming {
+                    Some(Ok(Message::Binary(data))) => {
+                        if subscriber.mode == "write" {
+                            handle.push_dap_input(data.to_vec());
+                        } else {
+                            send_json(&mut tx, &SessionWsMessage::Error {
+                                code: "write_forbidden".into(),
+                                message: "subscriber is read-only".into(),
+                            }).await?;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    handle.detach(&subscriber.id);
+    let _ = session::close_dap_session(&inner, &handle).await;
+    Ok(())
+}
+
+async fn dap_replay_ws(
+    ws_stream: dropshot::WebsocketConnection,
+    handle: Arc<runtime::SessionHandle>,
+    subscriber: Subscriber,
+    query: IoQuery,
+) -> WsResult {
+    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        ws_stream.into_inner(),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let (mut tx, mut _rx) = ws_stream.split();
+    let snapshot = handle.snapshot();
+    let after = query.after.unwrap_or(0);
+    let hello = SessionWsMessage::Hello {
+        v: PROTOCOL_VERSION,
+        protocol: PROTOCOL_VERSION,
+        subscriber_id: subscriber.id.clone(),
+        mode: subscriber.mode.clone(),
+        session: snapshot.clone(),
+        data_seq: after,
+        oldest_seq: snapshot.data.oldest_seq,
+        latest_seq: snapshot.data.latest_seq,
+    };
+    send_json(&mut tx, &hello).await?;
+
+    for event in handle.replay(after, true) {
+        match &event.data {
+            runtime::session::SessionEventData::Bytes(data) => {
+                send_binary(&mut tx, "dap", event.seq, 0, data).await?;
+            }
+            runtime::session::SessionEventData::Input(data) => {
+                send_binary(&mut tx, "dap", event.seq, 1, data).await?;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = send_json(
+        &mut tx,
+        &SessionWsMessage::Ended {
+            session: handle.snapshot(),
+        },
+    )
+    .await;
+    let _ = tx
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "session ended".into(),
+        })))
+        .await;
+    handle.detach(&subscriber.id);
     Ok(())
 }
 

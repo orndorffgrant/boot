@@ -243,6 +243,7 @@ pub enum TokenChange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ReconnectMode {
     None,
     Bounded(u32),
@@ -295,6 +296,12 @@ pub enum ServiceAction {
     Start,
     Stop,
     Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DapTransport {
+    Tcp { port: u16 },
+    Stdio,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +372,13 @@ pub enum Action {
         artifact: ArtifactRef,
         baud_rate: Option<u32>,
         policy: FollowSessionPolicy,
+    },
+    StartDapBridge {
+        server: Key<ServerConfig>,
+        resource: Key<ResourceHandle>,
+        transport: DapTransport,
+        artifact: ArtifactRef,
+        inherit_artifact: bool,
     },
     FollowSession {
         session: Key<SessionHandle>,

@@ -193,8 +193,14 @@ impl Command {
             Self::RunFirmware(args) => CommandIntent::RunFirmware(args.try_into()?),
             Self::AttachProbe(args) => CommandIntent::AttachProbe(args.try_into()?),
             Self::StartDap(args) => {
-                let (target, port) = args.try_into()?;
-                CommandIntent::StartDap { target, port }
+                let (target, port, stdio, artifact, inherit_artifact) = args.try_into()?;
+                CommandIntent::StartDap {
+                    target,
+                    port,
+                    stdio,
+                    artifact,
+                    inherit_artifact,
+                }
             }
             Self::ListSerialPorts(args) => CommandIntent::ListSerialPorts {
                 server: args.server,

@@ -109,18 +109,42 @@ impl TryFrom<AttachProbeArgs> for AttachProbeIntent {
 pub struct StartDapArgs {
     /// Server name and debug probe selector in format: {server-name}/{debugprobeselector}
     pub server_and_selector: String,
-    /// Port to listen on for DAP connections (default: 50000)
-    #[arg(short, long, default_value = "50000")]
-    pub port: u16,
+    /// TCP port to listen on (default: 50000)
+    #[arg(short, long, conflicts_with = "stdio")]
+    pub port: Option<u16>,
+    /// Serve DAP over stdin/stdout instead of TCP
+    #[arg(long, conflicts_with = "port")]
+    pub stdio: bool,
+    /// Upload this ELF and use it as the debug program
+    #[arg(long, conflicts_with_all = ["artifact", "inherit_artifact"])]
+    pub elf: Option<PathBuf>,
+    /// Use an existing artifact as the debug program
+    #[arg(long, conflicts_with_all = ["elf", "inherit_artifact"])]
+    pub artifact: Option<String>,
+    /// Use the probe's last flashed artifact when the client supplies no program
+    #[arg(long, conflicts_with_all = ["elf", "artifact"])]
+    pub inherit_artifact: bool,
 }
 
-impl TryFrom<StartDapArgs> for (ResourceSelector, u16) {
+impl TryFrom<StartDapArgs> for (ResourceSelector, Option<u16>, bool, ArtifactSource, bool) {
     type Error = CliError;
 
     fn try_from(args: StartDapArgs) -> Result<Self, Self::Error> {
+        let artifact = if let Some(path) = args.elf {
+            ArtifactSource::Upload(path)
+        } else if let Some(id) = args.artifact {
+            ArtifactSource::Existing(id)
+        } else if args.inherit_artifact {
+            ArtifactSource::Inherit
+        } else {
+            ArtifactSource::Clear
+        };
         Ok((
             ResourceSelector::parse(&args.server_and_selector)?,
             args.port,
+            args.stdio,
+            artifact,
+            args.inherit_artifact,
         ))
     }
 }

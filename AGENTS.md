@@ -69,6 +69,10 @@ Ownership rules:
   - The runtime owns hardware access, policy, lifecycle, and recovery.
   - The store implements narrow capability traits over one shared database.
   - Blocking hardware operations run on dedicated threads, not async workers.
+- **`boot-dap`** — native DAP adapter used by `boot-api` runtime sessions.
+  - It owns DAP framing, request dispatch, debugger state, RTT/REPL/SVD views,
+    and the native probe-rs/probe-rs-debug integration.
+  - It is server-only and is not a dependency of the protocol or client crates.
 - **`boot-api-client`** — generated typed HTTP client from the server's OpenAPI
   document.
 - **`boot-cli`** — user-facing workflows, rendering, decoding, reconnection,
