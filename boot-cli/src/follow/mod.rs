@@ -6,7 +6,8 @@ pub mod dap;
 use std::time::Duration;
 
 use boot_protocol::{
-    Change, ChangeWsMessage, LogEntry, RttRecord, Session, SessionWsMessage, decode_session_frame,
+    Change, ChangeWsMessage, FrameDirection, FrameRecord, GapPayload, LogEntry, RttRecord,
+    RttRecordsPayload, Session, SessionFrameHeader, SessionWsMessage, decode_frame, encode_frame,
 };
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -200,15 +201,15 @@ pub enum SessionEvent {
     State(Session),
     DecoderChanged(Session),
     Raw {
-        channel: u8,
+        stream: u8,
         data: Vec<u8>,
     },
     RttRecords {
-        channel: u8,
+        stream: u8,
         records: Vec<RttRecord>,
     },
     RttDecodeError {
-        channel: u8,
+        stream: u8,
         message: String,
     },
     Input(Vec<u8>),
@@ -289,7 +290,19 @@ pub async fn follow_session(
                 }
                 chunk = input_future => {
                     if let Some(chunk) = chunk {
-                        if tx.send(Message::Binary(chunk.into())).await.is_err() {
+                        let frame = encode_frame(
+                            &SessionFrameHeader {
+                                flags: 0,
+                                record: FrameRecord::Data,
+                                direction: FrameDirection::Input,
+                                stream: 0,
+                                seq: 0,
+                                timestamp_ns: 0,
+                            },
+                            &chunk,
+                        )
+                        .map_err(|error| CliError::Config(error.to_string()))?;
+                        if tx.send(Message::Binary(frame.into())).await.is_err() {
                             break;
                         }
                     } else {
@@ -356,38 +369,6 @@ pub async fn follow_session(
                                     observer(SessionEvent::Ended(state));
                                     break;
                                 }
-                                SessionWsMessage::Gap { from_seq, to_seq, dropped_bytes } => {
-                                    let gap = SessionGap { from_seq, to_seq, dropped_bytes };
-                                    observer(SessionEvent::Gap(gap.clone()));
-                                    if options.strict_replay {
-                                        return Err(CliError::Config(format!(
-                                            "session replay gap: missing data from {from_seq} to {to_seq}"
-                                        )));
-                                    }
-                                    cursor = Some(cursor.unwrap_or(0).max(to_seq));
-                                }
-                                SessionWsMessage::Input { seq, data } => {
-                                    cursor = Some(cursor.unwrap_or(0).max(seq));
-                                    use base64::Engine;
-                                    if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
-                                        observer(SessionEvent::Input(bytes));
-                                    }
-                                }
-                                SessionWsMessage::RttRecords { seq, channel, records, .. } => {
-                                    cursor = Some(cursor.unwrap_or(0).max(seq));
-                                    observer(SessionEvent::RttRecords { channel, records });
-                                }
-                                SessionWsMessage::RttRaw { seq, channel, data, .. } => {
-                                    cursor = Some(cursor.unwrap_or(0).max(seq));
-                                    use base64::Engine;
-                                    if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(data) {
-                                        observer(SessionEvent::Raw { channel, data: bytes });
-                                    }
-                                }
-                                SessionWsMessage::RttDecodeError { seq, channel, message, .. } => {
-                                    cursor = Some(cursor.unwrap_or(0).max(seq));
-                                    observer(SessionEvent::RttDecodeError { channel, message });
-                                }
                                 SessionWsMessage::DecoderChanged { session: state } => {
                                     session = Some(state.clone());
                                     observer(SessionEvent::DecoderChanged(state));
@@ -399,17 +380,79 @@ pub async fn follow_session(
                             }
                         }
                         Ok(Message::Binary(data)) => {
-                            let kind = session
-                                .as_ref()
-                                .map(|session| session.kind.as_str())
-                                .unwrap_or("serial");
-                            match decode_session_frame(kind, &data) {
+                            match decode_frame(&data) {
                                 Ok(frame) => {
-                                    cursor = Some(cursor.unwrap_or(0).max(frame.seq));
-                                    observer(SessionEvent::Raw {
-                                        channel: frame.channel.unwrap_or(0),
-                                        data: frame.data.to_vec(),
-                                    });
+                                    match frame.header.record {
+                                        FrameRecord::Data => {
+                                            cursor = Some(cursor.unwrap_or(0).max(frame.header.seq));
+                                            match frame.header.direction {
+                                                FrameDirection::Input => {
+                                                    observer(SessionEvent::Input(frame.payload.to_vec()));
+                                                }
+                                                FrameDirection::Output => {
+                                                    observer(SessionEvent::Raw {
+                                                        stream: frame.header.stream,
+                                                        data: frame.payload.to_vec(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        FrameRecord::RttRecords => {
+                                            cursor = Some(cursor.unwrap_or(0).max(frame.header.seq));
+                                            match serde_json::from_slice::<RttRecordsPayload>(frame.payload) {
+                                                Ok(payload) => {
+                                                    let stream = frame.header.stream;
+                                                    if !payload.records.is_empty() {
+                                                        observer(SessionEvent::RttRecords {
+                                                            stream,
+                                                            records: payload.records,
+                                                        });
+                                                    }
+                                                    if let Some(raw) = payload.raw_fallback {
+                                                        use base64::Engine;
+                                                        if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(raw) {
+                                                            observer(SessionEvent::Raw { stream, data: bytes });
+                                                        }
+                                                    }
+                                                    if let Some(message) = payload.error {
+                                                        observer(SessionEvent::RttDecodeError { stream, message });
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    observer(SessionEvent::Error {
+                                                        code: "bad_rtt_payload".to_string(),
+                                                        message: error.to_string(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        FrameRecord::Gap => {
+                                            match GapPayload::decode(frame.payload) {
+                                                Ok(gap) => {
+                                                    let event = SessionGap {
+                                                        from_seq: gap.from_seq,
+                                                        to_seq: gap.to_seq,
+                                                        dropped_bytes: gap.dropped_bytes,
+                                                    };
+                                                    observer(SessionEvent::Gap(event));
+                                                    if options.strict_replay {
+                                                        return Err(CliError::Config(format!(
+                                                            "session replay gap: missing data from {} to {}",
+                                                            gap.from_seq, gap.to_seq
+                                                        )));
+                                                    }
+                                                    cursor = Some(cursor.unwrap_or(0).max(gap.to_seq));
+                                                }
+                                                Err(error) => {
+                                                    observer(SessionEvent::Error {
+                                                        code: "bad_gap".to_string(),
+                                                        message: error.to_string(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        FrameRecord::Mark | FrameRecord::SessionHeader => {}
+                                    }
                                 }
                                 Err(error) => {
                                     observer(SessionEvent::Error {

@@ -1130,6 +1130,11 @@ single follower's laptop sleeping does not terminate everyone else's stream.
 
 ### 10.4 Fanout, ring, and framing
 
+> Superseded: the live frame layout and kind-specific data paths in this
+> section are replaced by
+> [session-data-framing-design.md](session-data-framing-design.md). The ring,
+> cursor, gap, and backpressure rules remain in force.
+
 The change-follow stream never carries session bytes. Each session has **one**
 bounded ring of `Bytes` chunks and a monotonic `data_seq`. Subscribers store only
 a cursor; they do not each get a hardware buffer or a copy of the ring.
@@ -1364,6 +1369,11 @@ Rules:
 `GET /v1/changes/{id}` remains available for a one-shot snapshot.
 
 ### 11.2 Session data protocol
+
+> Superseded for data framing: binary data uses the frames defined in
+> [session-data-framing-design.md](session-data-framing-design.md). The
+> `hello`, lifecycle, error, and close semantics in this section remain in
+> force.
 
 `GET /v1/sessions/{id}/io` upgrades to a WebSocket. Every upgrade is a new
 subscriber. First server frame:
@@ -1900,6 +1910,10 @@ CREATE INDEX sessions_by_state ON sessions(state, updated_at);
 attempt. They are replayed as control messages, not payload.
 
 ### 14.4 Session data log
+
+> Superseded: the record layout in this section is replaced by
+> [session-data-framing-design.md](session-data-framing-design.md). The
+> append-only, monotonic-sequence, gap, and recovery rules remain in force.
 
 Each serial and RTT session writes append-only segment files. DAP streams are not
 persisted for replay; only DAP session metadata is retained. A segment rotates at

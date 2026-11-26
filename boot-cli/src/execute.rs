@@ -1197,14 +1197,14 @@ impl<'a> Executor<'a> {
                     sink.status(&format!("decoder changed: {decoder}"));
                 }
             }
-            SessionEvent::Raw { channel, data } => {
-                let _ = sink.raw(channel, &data);
+            SessionEvent::Raw { stream, data } => {
+                let _ = sink.raw(stream, &data);
             }
-            SessionEvent::RttRecords { channel, records } => {
-                let _ = sink.rtt_records(channel, &records);
+            SessionEvent::RttRecords { stream, records } => {
+                let _ = sink.rtt_records(stream, &records);
             }
-            SessionEvent::RttDecodeError { channel, message } => {
-                sink.status(&format!("decoder[{channel}]: {message}"));
+            SessionEvent::RttDecodeError { stream, message } => {
+                sink.status(&format!("decoder[{stream}]: {message}"));
             }
             SessionEvent::Input(data) => {
                 let _ = sink.input(&data);

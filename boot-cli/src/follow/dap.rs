@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use boot_protocol::{Session, SessionWsMessage};
+use boot_protocol::{FrameDirection, FrameRecord, Session, SessionWsMessage, decode_frame};
 use futures::StreamExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
@@ -48,11 +48,27 @@ pub async fn replay(
     while let Some(message) = rx.next().await {
         match message {
             Ok(Message::Binary(data)) => {
-                let frame = boot_protocol::decode_session_frame("dap", &data)
-                    .map_err(|error| CliError::config(error.to_string()))?;
-                let direction = frame.channel.unwrap_or(0);
-                for message in parser.push(direction, frame.data)? {
-                    renderer.render(&message, &ui);
+                let frame =
+                    decode_frame(&data).map_err(|error| CliError::config(error.to_string()))?;
+                match frame.header.record {
+                    FrameRecord::Data => {
+                        let direction = match frame.header.direction {
+                            FrameDirection::Output => 0,
+                            FrameDirection::Input => 1,
+                        };
+                        for message in parser.push(direction, frame.payload)? {
+                            renderer.render(&message, &ui);
+                        }
+                    }
+                    FrameRecord::Gap => {
+                        let gap = boot_protocol::GapPayload::decode(frame.payload)
+                            .map_err(|error| CliError::config(error.to_string()))?;
+                        ui.error(&format!(
+                            "DAP transcript is missing data from {} to {}",
+                            gap.from_seq, gap.to_seq
+                        ));
+                    }
+                    _ => {}
                 }
             }
             Ok(Message::Text(text)) => {

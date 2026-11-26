@@ -8,6 +8,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod frame;
+pub use frame::*;
+
 pub const PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -235,7 +238,11 @@ pub struct SessionData {
     pub oldest_seq: u64,
     pub latest_seq: u64,
     pub buffered_bytes: u64,
+    /// Canonical output `DATA` payload bytes.
     pub bytes: u64,
+    /// Canonical input `DATA` payload bytes.
+    #[serde(default)]
+    pub input_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -452,36 +459,6 @@ pub enum SessionWsMessage {
     Failed { session: Session, error: String },
     #[serde(rename = "session.ended")]
     Ended { session: Session },
-    #[serde(rename = "gap")]
-    Gap {
-        from_seq: u64,
-        to_seq: u64,
-        dropped_bytes: u64,
-    },
-    #[serde(rename = "session.input")]
-    Input { seq: u64, data: String },
-    #[serde(rename = "rtt.records")]
-    RttRecords {
-        seq: u64,
-        channel: u8,
-        epoch: u64,
-        records: Vec<RttRecord>,
-    },
-    #[serde(rename = "rtt.raw")]
-    RttRaw {
-        seq: u64,
-        channel: u8,
-        epoch: u64,
-        /// Base64; the bytes are not necessarily UTF-8.
-        data: String,
-    },
-    #[serde(rename = "rtt.decode_error")]
-    RttDecodeError {
-        seq: u64,
-        channel: u8,
-        epoch: u64,
-        message: String,
-    },
     #[serde(rename = "session.decoder")]
     DecoderChanged { session: Session },
     #[serde(rename = "error")]
@@ -490,62 +467,6 @@ pub enum SessionWsMessage {
     Ping,
     #[serde(rename = "pong")]
     Pong,
-}
-
-/// One binary session data frame.
-///
-/// Layout: `u64` big-endian sequence, an optional channel/direction byte for
-/// RTT/DAP, then the payload bytes. For DAP the byte is the direction:
-/// 0 = adapter-to-client, 1 = client-to-adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionDataFrame<'a> {
-    pub seq: u64,
-    pub channel: Option<u8>,
-    pub data: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionFrameError {
-    TooShort,
-}
-
-impl std::fmt::Display for SessionFrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("session frame is too short")
-    }
-}
-
-impl std::error::Error for SessionFrameError {}
-
-pub fn decode_session_frame<'a>(
-    kind: &str,
-    bytes: &'a [u8],
-) -> Result<SessionDataFrame<'a>, SessionFrameError> {
-    let channel_bytes = usize::from(kind == "rtt" || kind == "dap");
-    if bytes.len() < 8 + channel_bytes {
-        return Err(SessionFrameError::TooShort);
-    }
-    let seq = u64::from_be_bytes(bytes[..8].try_into().expect("checked length"));
-    let (channel, offset) = if channel_bytes == 1 {
-        (Some(bytes[8]), 9)
-    } else {
-        (None, 8)
-    };
-    Ok(SessionDataFrame {
-        seq,
-        channel,
-        data: &bytes[offset..],
-    })
-}
-
-pub fn encode_session_frame(kind: &str, seq: u64, channel: u8, data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9 + data.len());
-    frame.extend_from_slice(&seq.to_be_bytes());
-    if kind == "rtt" || kind == "dap" {
-        frame.push(channel);
-    }
-    frame.extend_from_slice(data);
-    frame
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -565,10 +486,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rtt_record_messages_round_trip() {
-        let message = SessionWsMessage::RttRecords {
-            seq: 7,
-            channel: 0,
+    fn rtt_records_payload_round_trips() {
+        let payload = RttRecordsPayload {
+            v: 1,
             epoch: 2,
             records: vec![RttRecord {
                 timestamp: Some("1.5".into()),
@@ -578,24 +498,14 @@ mod tests {
                 line: Some(7),
                 message: "ready".into(),
             }],
+            raw_fallback: Some("aGk=".into()),
+            error: None,
         };
-        let json = serde_json::to_string(&message).unwrap();
-        assert!(json.contains("\"type\":\"rtt.records\""));
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"raw_fallback\":\"aGk=\""));
         assert_eq!(
-            serde_json::from_str::<SessionWsMessage>(&json).unwrap(),
-            message
-        );
-
-        let raw = SessionWsMessage::RttRaw {
-            seq: 8,
-            channel: 1,
-            epoch: 0,
-            data: "aGk=".into(),
-        };
-        let json = serde_json::to_string(&raw).unwrap();
-        assert_eq!(
-            serde_json::from_str::<SessionWsMessage>(&json).unwrap(),
-            raw
+            serde_json::from_str::<RttRecordsPayload>(&json).unwrap(),
+            payload
         );
     }
 
@@ -608,37 +518,10 @@ mod tests {
     }
 
     #[test]
-    fn session_data_frames_round_trip() {
-        let rtt = encode_session_frame("rtt", 7, 3, b"hello");
-        let frame = decode_session_frame("rtt", &rtt).unwrap();
-        assert_eq!(frame.seq, 7);
-        assert_eq!(frame.channel, Some(3));
-        assert_eq!(frame.data, b"hello");
-
-        let serial = encode_session_frame("serial", 9, 0, b"world");
-        let frame = decode_session_frame("serial", &serial).unwrap();
-        assert_eq!(frame.seq, 9);
-        assert_eq!(frame.channel, None);
-        assert_eq!(frame.data, b"world");
-
-        let dap = encode_session_frame("dap", 11, 1, b"request");
-        assert_eq!(&dap[8..9], &[1]);
-        let frame = decode_session_frame("dap", &dap).unwrap();
-        assert_eq!(frame.seq, 11);
-        assert_eq!(frame.channel, Some(1));
-        assert_eq!(frame.data, b"request");
-    }
-
-    #[test]
-    fn session_data_frame_rejects_short_input() {
-        assert_eq!(
-            decode_session_frame("serial", &[0; 7]),
-            Err(SessionFrameError::TooShort)
-        );
-        assert_eq!(
-            decode_session_frame("rtt", &[0; 8]),
-            Err(SessionFrameError::TooShort)
-        );
+    fn session_data_defaults_include_input_bytes() {
+        let data = SessionData::default();
+        assert_eq!(data.bytes, 0);
+        assert_eq!(data.input_bytes, 0);
     }
 
     #[test]

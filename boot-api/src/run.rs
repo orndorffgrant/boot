@@ -278,7 +278,10 @@ impl BootApi for ServerImpl {
             changes: runtime.changes().len(),
             sessions: sessions.len(),
             subscribers: sessions.iter().map(|s| s.subscribers as usize).sum(),
-            storage_bytes: sessions.iter().map(|s| s.data.bytes).sum(),
+            storage_bytes: sessions
+                .iter()
+                .map(|session| session.data.bytes + session.data.input_bytes)
+                .sum(),
         }))
     }
 
@@ -811,26 +814,17 @@ impl BootApi for ServerImpl {
             }
             Err(error) => return Err(map_error(error)),
         };
-        let is_dap = session.kind == "dap";
         upgraded.handle(move |ws_stream| async move {
-            if is_dap {
-                if dap_terminal {
-                    dap_replay_ws(ws_stream, handle, subscriber, query).await
-                } else {
-                    dap_session_io_ws(
-                        ws_stream,
-                        runtime.inner.clone(),
-                        auth_state,
-                        principal,
-                        handle,
-                        subscriber,
-                        query,
-                    )
-                    .await
-                }
-            } else {
-                session_io_ws(ws_stream, runtime.inner.clone(), handle, subscriber, query).await
-            }
+            session_io_ws(
+                ws_stream,
+                runtime.inner.clone(),
+                auth_state,
+                principal,
+                handle,
+                subscriber,
+                query,
+            )
+            .await
         })
     }
 
@@ -860,7 +854,10 @@ impl BootApi for ServerImpl {
             ));
         }
         let include_input = query.include_input.unwrap_or(false);
-        let events = handle.replay(0, include_input);
+        let replay_handle = handle.clone();
+        let events = tokio::task::spawn_blocking(move || replay_handle.replay(0, include_input))
+            .await
+            .map_err(|error| HttpError::for_internal_error(error.to_string()))?;
         let mut lines = Vec::new();
         lines.push(
             serde_json::json!({
@@ -872,29 +869,73 @@ impl BootApi for ServerImpl {
             })
             .to_string(),
         );
-        let mut last_ms = events.first().map(|event| event.timestamp_ms).unwrap_or(0);
+        let mut last_ms = events
+            .first()
+            .map(|event| event.timestamp_ns / 1_000_000)
+            .unwrap_or(0);
         for event in events {
-            use runtime::session::SessionEventData;
-            let (text, code) = match &event.data {
-                SessionEventData::Bytes(data) => (utf8_text(data)?, "o"),
-                SessionEventData::Input(data) => (utf8_text(data)?, "i"),
-                SessionEventData::RttRecords { records, raw, .. } => {
-                    let mut text = records
+            let (text, code) = match event.record {
+                boot_protocol::FrameRecord::Data => {
+                    if event.direction == boot_protocol::FrameDirection::Input {
+                        (utf8_text(&event.payload)?, "i")
+                    } else {
+                        (utf8_text(&event.payload)?, "o")
+                    }
+                }
+                boot_protocol::FrameRecord::RttRecords => {
+                    let payload: boot_protocol::RttRecordsPayload =
+                        serde_json::from_slice(&event.payload).map_err(|error| {
+                            HttpError::for_internal_error(format!(
+                                "invalid RTT records payload: {error}"
+                            ))
+                        })?;
+                    let mut text = payload
+                        .records
                         .iter()
                         .map(boot_protocol::RttRecord::display_line)
                         .collect::<String>();
-                    if let Some(raw) = raw {
-                        text.push_str(&String::from_utf8_lossy(raw));
+                    if let Some(raw) = payload.raw_fallback {
+                        use base64::Engine;
+                        if let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(raw.as_bytes()) {
+                            text.push_str(&String::from_utf8_lossy(&bytes));
+                        }
                     }
                     (text, "o")
                 }
-                SessionEventData::RttRaw { data, .. } => (utf8_text(data)?, "o"),
+                boot_protocol::FrameRecord::Gap => {
+                    let gap =
+                        boot_protocol::GapPayload::decode(&event.payload).map_err(|error| {
+                            HttpError::for_internal_error(format!("invalid gap payload: {error}"))
+                        })?;
+                    (
+                        format!(
+                            "[session gap from {} to {} ({} bytes)]\n",
+                            gap.from_seq, gap.to_seq, gap.dropped_bytes
+                        ),
+                        "m",
+                    )
+                }
+                boot_protocol::FrameRecord::Mark => {
+                    let mark: boot_protocol::MarkPayload = serde_json::from_slice(&event.payload)
+                        .map_err(|error| {
+                        HttpError::for_internal_error(format!(
+                            "invalid session mark payload: {error}"
+                        ))
+                    })?;
+                    if mark.event == "session.closed" {
+                        ("0".to_string(), "x")
+                    } else {
+                        (format!("[{}]\n", mark.event), "m")
+                    }
+                }
+                boot_protocol::FrameRecord::SessionHeader => continue,
             };
             if text.is_empty() {
                 continue;
             }
-            let interval = (event.timestamp_ms.saturating_sub(last_ms)) as f64 / 1000.0;
-            last_ms = event.timestamp_ms;
+            let timestamp_ms = event.timestamp_ns / 1_000_000;
+            let interval = (timestamp_ms.saturating_sub(last_ms)) as f64 / 1000.0;
+            last_ms = timestamp_ms;
             lines.push(serde_json::json!([interval, code, text]).to_string());
         }
         let cast = format!("{}\n", lines.join("\n"));
@@ -1257,6 +1298,8 @@ async fn follow_change_ws(
 async fn session_io_ws(
     ws_stream: dropshot::WebsocketConnection,
     inner: Arc<runtime::RuntimeInner>,
+    auth_state: AuthState,
+    principal: crate::auth::Principal,
     handle: Arc<runtime::SessionHandle>,
     subscriber: Subscriber,
     query: IoQuery,
@@ -1269,7 +1312,9 @@ async fn session_io_ws(
     .await;
     let (mut tx, mut rx) = ws_stream.split();
     let snapshot = handle.snapshot();
+    let is_dap = snapshot.kind == "dap";
     let include_input = query.include_input.unwrap_or(false);
+    let replayable_at_attach = snapshot.replayable;
     let after = query.after.unwrap_or_else(|| {
         if snapshot.replayable
             && matches!(snapshot.state.as_str(), "closed" | "failed" | "suspended")
@@ -1279,6 +1324,7 @@ async fn session_io_ws(
             snapshot.data.latest_seq
         }
     });
+    let after = after.min(snapshot.data.latest_seq);
     let hello = SessionWsMessage::Hello {
         v: PROTOCOL_VERSION,
         protocol: PROTOCOL_VERSION,
@@ -1291,9 +1337,43 @@ async fn session_io_ws(
     };
     send_json(&mut tx, &hello).await?;
     let mut cursor = after;
-    for event in handle.replay(after, include_input) {
+    let replay_include_input = include_input || (is_dap && snapshot.replayable);
+    let replay_handle = handle.clone();
+    let replay =
+        tokio::task::spawn_blocking(move || replay_handle.replay(after, replay_include_input))
+            .await?;
+    let has_log_gap = replay
+        .iter()
+        .find(|event| event.seq > after)
+        .and_then(|event| {
+            (event.record == FrameRecord::Gap)
+                .then(|| GapPayload::decode(&event.payload).ok())
+                .flatten()
+        })
+        .is_some_and(|gap| gap.from_seq <= cursor.saturating_add(1));
+    if !has_log_gap && snapshot.data.oldest_seq > cursor.saturating_add(1) {
+        send_gap(
+            &mut tx,
+            cursor.saturating_add(1),
+            snapshot.data.oldest_seq.saturating_sub(1),
+        )
+        .await?;
+        cursor = snapshot.data.oldest_seq.saturating_sub(1);
+    }
+    for event in replay {
+        if event.record == FrameRecord::Mark {
+            if let Ok(mark) = serde_json::from_slice::<MarkPayload>(&event.payload)
+                && mark.event == "session.decoder"
+                && let Ok(decode) = serde_json::from_value::<SessionDecode>(mark.detail)
+            {
+                let mut session = handle.snapshot();
+                session.decode = decode;
+                send_json(&mut tx, &SessionWsMessage::DecoderChanged { session }).await?;
+            }
+            continue;
+        }
         cursor = cursor.max(event.seq);
-        send_session_event(&mut tx, &handle.kind, &event).await?;
+        send_frame(&mut tx, &event).await?;
     }
     if matches!(snapshot.state.as_str(), "closed" | "failed" | "suspended") {
         let _ = send_json(
@@ -1314,16 +1394,48 @@ async fn session_io_ws(
     }
     let mut lifecycle = handle.lifecycle_tx.subscribe();
     let mut decode_epoch = snapshot.decode.epoch;
+    let mut replayable = replayable_at_attach;
+    let mut revalidate = tokio::time::interval(std::time::Duration::from_secs(30));
+    revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     'session_loop: loop {
+        let evicted_through = handle.ring_evicted_through();
+        if evicted_through > cursor {
+            if is_dap {
+                let _ = send_json(
+                    &mut tx,
+                    &SessionWsMessage::Failed {
+                        session: handle.snapshot(),
+                        error: "dap_output_overflow".into(),
+                    },
+                )
+                .await;
+                session::fail_session(&inner, &handle, "dap_output_overflow".into()).await;
+                break 'session_loop;
+            }
+            send_gap(&mut tx, cursor.saturating_add(1), evicted_through).await?;
+            cursor = evicted_through;
+        }
         let chunks = handle.read_after(cursor);
         if !chunks.is_empty() {
             for event in chunks {
                 cursor = event.seq;
-                send_session_event(&mut tx, &handle.kind, &event).await?;
+                send_frame(&mut tx, &event).await?;
             }
             continue;
         }
         tokio::select! {
+            _ = revalidate.tick() => {
+                if !auth_state
+                    .is_authorized(&principal, crate::auth::Capability::Control)
+                    .await
+                {
+                    let _ = send_json(&mut tx, &SessionWsMessage::Error {
+                        code: "unauthorized".into(),
+                        message: "token was revoked or expired".into(),
+                    }).await;
+                    break 'session_loop;
+                }
+            }
             _ = handle.notify.notified() => {}
             _ = handle.subscriber_changed.notified() => {
                 if !handle.subscribers.lock().expect("subscribers").iter().any(|sub| sub.id == subscriber.id) {
@@ -1333,12 +1445,24 @@ async fn session_io_ws(
             event = lifecycle.recv() => {
                 match event {
                     Ok(session) => {
+                        let degraded = replayable && !session.replayable;
+                        replayable = session.replayable;
                         if session.decode.epoch != decode_epoch {
                             decode_epoch = session.decode.epoch;
                             send_json(
                                 &mut tx,
                                 &SessionWsMessage::DecoderChanged {
                                     session: session.clone(),
+                                },
+                            )
+                            .await?;
+                        }
+                        if degraded {
+                            send_json(
+                                &mut tx,
+                                &SessionWsMessage::Degraded {
+                                    session: session.clone(),
+                                    reason: "persistence_failed".into(),
                                 },
                             )
                             .await?;
@@ -1381,125 +1505,54 @@ async fn session_io_ws(
                                 code: "write_forbidden".into(),
                                 message: "subscriber is read-only".into(),
                             }).await?;
-                        } else if handle.kind == "serial" {
-                            handle.push_input(&data);
-                            let sender = handle.input_tx.lock().expect("input").clone();
-                            if let Some(sender) = sender {
-                                let _ = sender.send(data.to_vec());
-                            }
+                            continue;
                         }
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-    handle.detach(&subscriber.id);
-    session::schedule_close_if_idle(inner.clone(), handle.clone());
-    Ok(())
-}
-
-async fn dap_session_io_ws(
-    ws_stream: dropshot::WebsocketConnection,
-    inner: Arc<runtime::RuntimeInner>,
-    auth_state: crate::auth::AuthState,
-    principal: crate::auth::Principal,
-    handle: Arc<runtime::SessionHandle>,
-    subscriber: Subscriber,
-    query: IoQuery,
-) -> WsResult {
-    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        ws_stream.into_inner(),
-        tokio_tungstenite::tungstenite::protocol::Role::Server,
-        None,
-    )
-    .await;
-    let (mut tx, mut rx) = ws_stream.split();
-    let snapshot = handle.snapshot();
-    let hello = SessionWsMessage::Hello {
-        v: PROTOCOL_VERSION,
-        protocol: PROTOCOL_VERSION,
-        subscriber_id: subscriber.id.clone(),
-        mode: subscriber.mode.clone(),
-        session: snapshot.clone(),
-        data_seq: snapshot.data.latest_seq,
-        oldest_seq: snapshot.data.oldest_seq,
-        latest_seq: snapshot.data.latest_seq,
-    };
-    send_json(&mut tx, &hello).await?;
-    let _ = query;
-
-    let Some(mut dap_output) = handle.dap_output_rx.lock().expect("dap output").take() else {
-        let _ = session::close_dap_session(&inner, &handle).await;
-        handle.detach(&subscriber.id);
-        return Ok(());
-    };
-    let mut lifecycle = handle.lifecycle_tx.subscribe();
-    let mut revalidate = tokio::time::interval(std::time::Duration::from_secs(30));
-    revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = revalidate.tick() => {
-                if !auth_state
-                    .is_authorized(&principal, crate::auth::Capability::Control)
-                    .await
-                {
-                    let _ = send_json(&mut tx, &SessionWsMessage::Error {
-                        code: "unauthorized".into(),
-                        message: "token was revoked or expired".into(),
-                    }).await;
-                    break;
-                }
-            }
-            data = dap_output.recv() => {
-                match data {
-                    Some((seq, data)) => {
-                        send_binary(&mut tx, "dap", seq, 0, &data).await?;
-                    }
-                    None => break,
-                }
-            }
-            event = lifecycle.recv() => {
-                match event {
-                    Ok(session) => {
-                        match session.state.as_str() {
-                            "active" => {
-                                send_json(&mut tx, &SessionWsMessage::Active { session }).await?;
+                        let frame = match decode_frame(&data) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                send_json(&mut tx, &SessionWsMessage::Error {
+                                    code: "bad_frame".into(),
+                                    message: error.to_string(),
+                                }).await?;
+                                send_protocol_close(&mut tx, "bad frame").await?;
+                                break 'session_loop;
                             }
-                            "closed" => {
-                                send_json(&mut tx, &SessionWsMessage::Ended { session }).await?;
-                                break;
-                            }
-                            "failed" => {
-                                send_json(
-                                    &mut tx,
-                                    &SessionWsMessage::Failed {
-                                        session,
-                                        error: "session failed".into(),
-                                    },
-                                )
-                                .await?;
-                                break;
-                            }
-                            _ => {}
+                        };
+                        if frame.header.direction != FrameDirection::Input
+                            || frame.header.record != FrameRecord::Data
+                            || frame.header.flags != 0
+                            || frame.header.seq != 0
+                            || frame.header.timestamp_ns != 0
+                        {
+                            send_json(&mut tx, &SessionWsMessage::Error {
+                                code: "invalid_input_frame".into(),
+                                message: "input frames must be DATA/INPUT with seq 0 and flags 0".into(),
+                            }).await?;
+                            send_protocol_close(&mut tx, "invalid input frame").await?;
+                            break 'session_loop;
                         }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            incoming = rx.next() => {
-                match incoming {
-                    Some(Ok(Message::Binary(data))) => {
-                        if subscriber.mode == "write" {
-                            handle.push_dap_input(data.to_vec());
+                        if frame.header.stream != 0 {
+                            send_json(&mut tx, &SessionWsMessage::Error {
+                                code: "invalid_input_stream".into(),
+                                message: "input stream must be 0 for this session".into(),
+                            }).await?;
+                            send_protocol_close(&mut tx, "invalid input stream").await?;
+                            break 'session_loop;
+                        }
+                        if is_dap || handle.kind == "serial" {
+                            if let Err(error) = handle.push_input(frame.header.stream, frame.payload.to_vec()) {
+                                if error.code == "session_closed" {
+                                    break 'session_loop;
+                                }
+                                send_json(&mut tx, &SessionWsMessage::Error {
+                                    code: error.code.to_string(),
+                                    message: error.message,
+                                }).await?;
+                            }
                         } else {
                             send_json(&mut tx, &SessionWsMessage::Error {
-                                code: "write_forbidden".into(),
-                                message: "subscriber is read-only".into(),
+                                code: "input_not_supported".into(),
+                                message: "this session kind does not accept input".into(),
                             }).await?;
                         }
                     }
@@ -1510,66 +1563,37 @@ async fn dap_session_io_ws(
             }
         }
     }
-
     handle.detach(&subscriber.id);
-    let _ = session::close_dap_session(&inner, &handle).await;
+    if is_dap {
+        if handle.snapshot().state != "failed" {
+            let _ = session::close_dap_session(&inner, &handle).await;
+        }
+    } else {
+        session::schedule_close_if_idle(inner.clone(), handle.clone());
+    }
     Ok(())
 }
 
-async fn dap_replay_ws(
-    ws_stream: dropshot::WebsocketConnection,
-    handle: Arc<runtime::SessionHandle>,
-    subscriber: Subscriber,
-    query: IoQuery,
-) -> WsResult {
-    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        ws_stream.into_inner(),
-        tokio_tungstenite::tungstenite::protocol::Role::Server,
-        None,
-    )
-    .await;
-    let (mut tx, mut _rx) = ws_stream.split();
-    let snapshot = handle.snapshot();
-    let after = query.after.unwrap_or(0);
-    let hello = SessionWsMessage::Hello {
-        v: PROTOCOL_VERSION,
-        protocol: PROTOCOL_VERSION,
-        subscriber_id: subscriber.id.clone(),
-        mode: subscriber.mode.clone(),
-        session: snapshot.clone(),
-        data_seq: after,
-        oldest_seq: snapshot.data.oldest_seq,
-        latest_seq: snapshot.data.latest_seq,
-    };
-    send_json(&mut tx, &hello).await?;
-
-    for event in handle.replay(after, true) {
-        match &event.data {
-            runtime::session::SessionEventData::Bytes(data) => {
-                send_binary(&mut tx, "dap", event.seq, 0, data).await?;
-            }
-            runtime::session::SessionEventData::Input(data) => {
-                send_binary(&mut tx, "dap", event.seq, 1, data).await?;
-            }
-            _ => {}
+async fn send_gap<S>(tx: &mut S, from_seq: u64, to_seq: u64) -> WsResult
+where
+    S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let event = session::SessionEvent {
+        seq: from_seq.saturating_sub(1),
+        timestamp_ns: runtime::now_unix_ns(),
+        stream: 0,
+        direction: FrameDirection::Output,
+        record: FrameRecord::Gap,
+        flags: 0,
+        payload: GapPayload {
+            from_seq,
+            to_seq,
+            dropped_bytes: 0,
         }
-    }
-
-    let _ = send_json(
-        &mut tx,
-        &SessionWsMessage::Ended {
-            session: handle.snapshot(),
-        },
-    )
-    .await;
-    let _ = tx
-        .send(Message::Close(Some(CloseFrame {
-            code: CloseCode::Normal,
-            reason: "session ended".into(),
-        })))
-        .await;
-    handle.detach(&subscriber.id);
-    Ok(())
+        .encode()
+        .to_vec(),
+    };
+    send_frame(tx, &event).await
 }
 
 async fn send_json<S>(tx: &mut S, message: &impl serde::Serialize) -> WsResult
@@ -1581,108 +1605,25 @@ where
     Ok(())
 }
 
-async fn send_binary<S>(tx: &mut S, kind: &str, seq: u64, channel: u8, data: &[u8]) -> WsResult
+async fn send_protocol_close<S>(tx: &mut S, reason: &str) -> WsResult
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let frame = boot_protocol::encode_session_frame(kind, seq, channel, data);
-    tx.send(Message::Binary(frame.into())).await?;
+    tx.send(Message::Close(Some(CloseFrame {
+        code: CloseCode::Protocol,
+        reason: reason.into(),
+    })))
+    .await?;
     Ok(())
 }
 
-async fn send_session_event<S>(
-    tx: &mut S,
-    kind: &str,
-    event: &runtime::session::SessionEvent,
-) -> WsResult
+async fn send_frame<S>(tx: &mut S, event: &runtime::session::SessionEvent) -> WsResult
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    use runtime::session::SessionEventData;
-    match &event.data {
-        SessionEventData::Bytes(data) => {
-            send_binary(tx, kind, event.seq, event.channel, data).await
-        }
-        SessionEventData::Input(data) => {
-            send_json(
-                tx,
-                &SessionWsMessage::Input {
-                    seq: event.seq,
-                    data: base64_encode(data),
-                },
-            )
-            .await
-        }
-        SessionEventData::RttRecords {
-            epoch,
-            records,
-            raw,
-            error,
-        } => {
-            if !records.is_empty() {
-                send_json(
-                    tx,
-                    &SessionWsMessage::RttRecords {
-                        seq: event.seq,
-                        channel: event.channel,
-                        epoch: *epoch,
-                        records: records.clone(),
-                    },
-                )
-                .await?;
-            }
-            if let Some(raw) = raw {
-                send_json(
-                    tx,
-                    &SessionWsMessage::RttRaw {
-                        seq: event.seq,
-                        channel: event.channel,
-                        epoch: *epoch,
-                        data: base64_encode(raw),
-                    },
-                )
-                .await?;
-            }
-            if let Some(message) = error {
-                send_json(
-                    tx,
-                    &SessionWsMessage::RttDecodeError {
-                        seq: event.seq,
-                        channel: event.channel,
-                        epoch: *epoch,
-                        message: message.clone(),
-                    },
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        SessionEventData::RttRaw { epoch, data, error } => {
-            send_json(
-                tx,
-                &SessionWsMessage::RttRaw {
-                    seq: event.seq,
-                    channel: event.channel,
-                    epoch: *epoch,
-                    data: base64_encode(data),
-                },
-            )
-            .await?;
-            if let Some(message) = error {
-                send_json(
-                    tx,
-                    &SessionWsMessage::RttDecodeError {
-                        seq: event.seq,
-                        channel: event.channel,
-                        epoch: *epoch,
-                        message: message.clone(),
-                    },
-                )
-                .await?;
-            }
-            Ok(())
-        }
-    }
+    let frame = event.encode()?;
+    tx.send(Message::Binary(frame.into())).await?;
+    Ok(())
 }
 
 fn utf8_text(data: &[u8]) -> Result<String, HttpError> {
@@ -1696,11 +1637,6 @@ fn utf8_text(data: &[u8]) -> Result<String, HttpError> {
 }
 
 type WsResult = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
-
-fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::prelude::BASE64_STANDARD.encode(data)
-}
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use boot_protocol::{Session, SessionAcquire, SessionOptions, SessionWsMessage};
+use boot_protocol::{
+    FrameDirection, FrameRecord, Session, SessionAcquire, SessionFrameHeader, SessionOptions,
+    SessionWsMessage, decode_frame, encode_frame,
+};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -231,11 +234,13 @@ where
                     if let Some(response) =
                         LaunchUploader::error_response(&frame, &error.to_string())
                     {
+                        let response = input_frame(&response)?;
                         let _ = ws_tx.send(Message::Binary(response.into())).await;
                     }
                     return Err(error);
                 }
             };
+            let frame = input_frame(&frame)?;
             if ws_tx.send(Message::Binary(frame.into())).await.is_err() {
                 break;
             }
@@ -247,11 +252,22 @@ where
         while let Some(message) = ws_rx.next().await {
             match message {
                 Ok(Message::Binary(data)) => {
-                    let frame = boot_protocol::decode_session_frame("dap", &data)
-                        .map_err(|error| CliError::config(error.to_string()))?;
-                    if frame.channel == Some(0) || frame.channel.is_none() {
-                        output.write_all(frame.data).await?;
-                        output.flush().await?;
+                    let frame =
+                        decode_frame(&data).map_err(|error| CliError::config(error.to_string()))?;
+                    match frame.header.record {
+                        FrameRecord::Data if frame.header.direction == FrameDirection::Output => {
+                            output.write_all(frame.payload).await?;
+                            output.flush().await?;
+                        }
+                        FrameRecord::Gap => {
+                            let gap = boot_protocol::GapPayload::decode(frame.payload)
+                                .map_err(|error| CliError::config(error.to_string()))?;
+                            ui.error(&format!(
+                                "DAP session gap from {} to {}",
+                                gap.from_seq, gap.to_seq
+                            ));
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Message::Text(text)) => {
@@ -273,4 +289,19 @@ where
         result = input_task => result,
         result = output_task => result,
     }
+}
+
+fn input_frame(payload: &[u8]) -> Result<Vec<u8>, CliError> {
+    encode_frame(
+        &SessionFrameHeader {
+            flags: 0,
+            record: FrameRecord::Data,
+            direction: FrameDirection::Input,
+            stream: 0,
+            seq: 0,
+            timestamp_ns: 0,
+        },
+        payload,
+    )
+    .map_err(|error| CliError::config(error.to_string()))
 }

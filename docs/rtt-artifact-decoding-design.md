@@ -471,6 +471,11 @@ it is used when a session requests inheritance. `GET /v1/probes` and
 
 ### 6.3 RTT data messages
 
+> Superseded: RTT data is carried in the common session frame's
+> `RTT_RECORDS` record, not in text data messages. See
+> [session-data-framing-design.md](session-data-framing-design.md). The
+> decode epoch, artifact selection, and decoded-record rules remain in force.
+
 RTT data uses text frames. Serial keeps its existing binary frame:
 `u64 seq (big-endian) + payload`.
 

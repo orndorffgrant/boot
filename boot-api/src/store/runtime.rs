@@ -35,17 +35,6 @@ pub struct SessionRecord {
 }
 
 #[derive(Debug, Clone, FromRow)]
-pub struct SegmentRecord {
-    pub session_id: String,
-    pub segment_no: i64,
-    pub first_seq: i64,
-    pub last_seq: i64,
-    pub bytes: i64,
-    pub path: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, FromRow)]
 pub struct ChangeRecord {
     pub id: String,
     pub kind: String,
@@ -87,8 +76,6 @@ pub trait RuntimeStore: Send + Sync {
     async fn update_session(&self, record: &SessionRecord) -> Result<(), StoreError>;
     async fn load_session(&self, id: &str) -> Result<Option<SessionRecord>, StoreError>;
     async fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError>;
-    async fn add_segment(&self, record: &SegmentRecord) -> Result<(), StoreError>;
-    async fn load_segments(&self, session_id: &str) -> Result<Vec<SegmentRecord>, StoreError>;
     async fn purge_session_data(&self, session_id: &str) -> Result<(), StoreError>;
     async fn insert_change(&self, record: &ChangeRecord) -> Result<(), StoreError>;
     async fn update_change(&self, record: &ChangeRecord) -> Result<(), StoreError>;
@@ -214,41 +201,7 @@ impl RuntimeStore for Store {
             .map_err(db_error)
     }
 
-    async fn add_segment(&self, record: &SegmentRecord) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO session_segments
-             (session_id, segment_no, first_seq, last_seq, bytes, path, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&record.session_id)
-        .bind(record.segment_no)
-        .bind(record.first_seq)
-        .bind(record.last_seq)
-        .bind(record.bytes)
-        .bind(&record.path)
-        .bind(record.created_at)
-        .execute(self.pool())
-        .await
-        .map_err(db_error)?;
-        Ok(())
-    }
-
-    async fn load_segments(&self, session_id: &str) -> Result<Vec<SegmentRecord>, StoreError> {
-        sqlx::query_as::<_, SegmentRecord>(
-            "SELECT * FROM session_segments WHERE session_id = ? ORDER BY segment_no",
-        )
-        .bind(session_id)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_error)
-    }
-
     async fn purge_session_data(&self, session_id: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM session_segments WHERE session_id = ?")
-            .bind(session_id)
-            .execute(self.pool())
-            .await
-            .map_err(db_error)?;
         sqlx::query("UPDATE sessions SET replayable = 0, first_seq = latest_seq, data_bytes = 0 WHERE id = ?")
             .bind(session_id)
             .execute(self.pool())

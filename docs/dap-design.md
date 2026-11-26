@@ -525,6 +525,11 @@ sends `session.ended` after the records. If the log is unavailable, it sends
 
 ### 7.3 Data path
 
+> Superseded for framing and buffering: DAP data uses the common session
+> frames and shared ring in
+> [session-data-framing-design.md](session-data-framing-design.md). DAP
+> exclusivity, close-on-detach, and fail-on-overflow remain in force.
+
 The DAP data plane uses boot session frames:
 
 ```text
@@ -642,6 +647,11 @@ A DAP client disconnect also closes the CLI bridge's TCP connection.
 
 ### 7.7 Data-plane recording
 
+> Superseded: DAP input and output are recorded as common `DATA` frames with
+> `direction` set, not as `RECORD_OUTPUT`/`RECORD_INPUT` with the direction in
+> the channel byte. See
+> [session-data-framing-design.md](session-data-framing-design.md).
+
 The session log is the DAP recording. There is no separate trace file or trace
 level.
 
@@ -690,6 +700,10 @@ RTT and serial are unchanged: retained data replays through `/io?after=...`.
 ## 8. Protocol and API changes
 
 ### 8.1 Wire framing
+
+> Superseded: use the common session frame in
+> [session-data-framing-design.md](session-data-framing-design.md) instead of
+> the 9-byte DAP-specific header.
 
 DAP binary frames use boot session framing:
 

@@ -42,28 +42,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS sessions_by_state ON sessions(state, updated_at);
 
-CREATE TABLE IF NOT EXISTS session_segments (
-    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    segment_no  INTEGER NOT NULL,
-    first_seq   INTEGER NOT NULL,
-    last_seq    INTEGER NOT NULL,
-    bytes       INTEGER NOT NULL,
-    path        TEXT NOT NULL,
-    created_at  INTEGER NOT NULL,
-    PRIMARY KEY (session_id, segment_no)
-);
-
-CREATE TABLE IF NOT EXISTS session_marks (
-    mark_id     TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,
-    at          INTEGER NOT NULL,
-    kind        TEXT NOT NULL,
-    detail_json TEXT
-);
-
-CREATE INDEX IF NOT EXISTS session_marks_by_session ON session_marks(session_id, seq);
-
 CREATE TABLE IF NOT EXISTS changes (
     id            TEXT PRIMARY KEY,
     kind          TEXT NOT NULL,

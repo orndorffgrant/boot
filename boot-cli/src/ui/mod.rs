@@ -51,8 +51,8 @@ pub trait Ui: Send + Sync {
 }
 
 pub trait SessionSink: Send {
-    fn raw(&mut self, channel: u8, data: &[u8]) -> Result<(), CliError>;
-    fn rtt_records(&mut self, channel: u8, records: &[RttRecord]) -> Result<(), CliError>;
+    fn raw(&mut self, stream: u8, data: &[u8]) -> Result<(), CliError>;
+    fn rtt_records(&mut self, stream: u8, records: &[RttRecord]) -> Result<(), CliError>;
     fn input(&mut self, data: &[u8]) -> Result<(), CliError>;
     fn status(&mut self, message: &str);
     fn gap(&mut self, gap: &SessionGap);
@@ -345,7 +345,7 @@ struct HumanSessionSink {
 }
 
 impl SessionSink for HumanSessionSink {
-    fn raw(&mut self, _channel: u8, data: &[u8]) -> Result<(), CliError> {
+    fn raw(&mut self, _stream: u8, data: &[u8]) -> Result<(), CliError> {
         let mut stdout = std::io::stdout().lock();
         match self.kind {
             SessionKind::Rtt => {
@@ -357,7 +357,7 @@ impl SessionSink for HumanSessionSink {
         Ok(())
     }
 
-    fn rtt_records(&mut self, _channel: u8, records: &[RttRecord]) -> Result<(), CliError> {
+    fn rtt_records(&mut self, _stream: u8, records: &[RttRecord]) -> Result<(), CliError> {
         let mut stdout = std::io::stdout().lock();
         for record in records {
             stdout.write_all(record.display_line().as_bytes())?;

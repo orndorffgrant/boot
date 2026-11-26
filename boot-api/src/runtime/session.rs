@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use boot_protocol::{
-    RttRecord, Session, SessionAcquire, SessionAcquireResult, SessionData, SessionDecode,
-    SessionPatch, Subscriber,
+    FRAME_FLAG_SUPERSEDED, FrameDirection, FrameRecord, GapPayload, MarkPayload, RttRecordsPayload,
+    SESSION_FRAME_HEADER_LEN, Session, SessionAcquire, SessionAcquireResult, SessionData,
+    SessionDecode, SessionFrameHeader, SessionPatch, Subscriber, encode_frame,
 };
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "run")]
@@ -20,9 +22,7 @@ use boot_dap::{DapBackend, DapIo, DapLaunch, NativeDapBackend};
 
 use crate::runtime::decode::{self, DecodeProfile, DecodeState};
 use crate::runtime::lease::LeaseGuard;
-use crate::runtime::session_log::{
-    self, LogRecord, RECORD_DECODED, RECORD_INPUT, RECORD_OUTPUT, SessionLogWriter,
-};
+use crate::runtime::session_log::{self, SessionLogReader, SessionLogWriter};
 use crate::runtime::{Runtime, RuntimeError, RuntimeInner, lease, new_id, now_rfc3339, now_unix};
 use crate::store::RuntimeStore;
 use crate::store::SessionRecord;
@@ -30,68 +30,44 @@ use crate::store::SessionRecord;
 #[derive(Debug, Clone)]
 enum ThreadEvent {
     Active,
-    Data { data: Vec<u8>, channel: u8 },
+    Data { data: Vec<u8>, stream: u8 },
     Error(String),
     Ended,
 }
 
 #[derive(Debug, Clone)]
-pub enum SessionEventData {
-    Bytes(Vec<u8>),
-    RttRecords {
-        epoch: u64,
-        records: Vec<RttRecord>,
-        raw: Option<Vec<u8>>,
-        error: Option<String>,
-    },
-    RttRaw {
-        epoch: u64,
-        data: Vec<u8>,
-        error: Option<String>,
-    },
-    Input(Vec<u8>),
-}
-
-impl SessionEventData {
-    fn len(&self) -> usize {
-        match self {
-            Self::Bytes(data) | Self::RttRaw { data, .. } | Self::Input(data) => data.len(),
-            Self::RttRecords { records, raw, .. } => {
-                records
-                    .iter()
-                    .map(|record| record.message.len() + 64)
-                    .sum::<usize>()
-                    + raw.as_ref().map(Vec::len).unwrap_or(0)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub seq: u64,
-    pub channel: u8,
-    pub timestamp_ms: u64,
-    pub data: SessionEventData,
+    pub timestamp_ns: u64,
+    pub stream: u8,
+    pub direction: FrameDirection,
+    pub record: FrameRecord,
+    pub flags: u8,
+    pub payload: Vec<u8>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DecodedPayload {
-    #[serde(default)]
-    epoch: u64,
-    #[serde(default)]
-    records: Vec<RttRecord>,
-    #[serde(default)]
-    raw: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
+impl SessionEvent {
+    fn header(&self) -> SessionFrameHeader {
+        SessionFrameHeader {
+            flags: self.flags,
+            record: self.record,
+            direction: self.direction,
+            stream: self.stream,
+            seq: self.seq,
+            timestamp_ns: self.timestamp_ns,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(encode_frame(&self.header(), &self.payload)?)
+    }
 }
 
 struct SessionRing {
     chunks: VecDeque<SessionEvent>,
     bytes: usize,
     max_bytes: usize,
-    latest_seq: u64,
+    evicted_through: u64,
 }
 
 impl SessionRing {
@@ -100,29 +76,23 @@ impl SessionRing {
             chunks: VecDeque::new(),
             bytes: 0,
             max_bytes,
-            latest_seq: 0,
+            evicted_through: 0,
         }
     }
 
-    fn push(&mut self, channel: u8, data: SessionEventData) -> u64 {
-        let seq = self.latest_seq + 1;
-        self.latest_seq = seq;
-        let timestamp_ms = now_unix() as u64 * 1000;
-        self.bytes += data.len().max(64);
-        self.chunks.push_back(SessionEvent {
-            seq,
-            channel,
-            timestamp_ms,
-            data,
-        });
-        while self.bytes > self.max_bytes {
+    fn push(&mut self, event: SessionEvent) {
+        let size = event.payload.len() + SESSION_FRAME_HEADER_LEN;
+        self.bytes += size;
+        self.chunks.push_back(event);
+        // Always retain the newest frame, even if it alone exceeds the cap.
+        while self.bytes > self.max_bytes && self.chunks.len() > 1 {
             if let Some(chunk) = self.chunks.pop_front() {
-                self.bytes = self.bytes.saturating_sub(chunk.data.len().max(64));
-            } else {
-                break;
+                self.evicted_through = chunk.seq;
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(chunk.payload.len() + SESSION_FRAME_HEADER_LEN);
             }
         }
-        seq
     }
 
     fn after(&self, cursor: u64) -> Vec<SessionEvent> {
@@ -142,13 +112,13 @@ pub struct SessionHandle {
     pub options_json: String,
     pub state: Mutex<Session>,
     ring: Mutex<SessionRing>,
+    sequence: AtomicU64,
+    last_timestamp_ns: AtomicU64,
+    append_lock: Mutex<()>,
     pub notify: Notify,
     pub subscriber_changed: Notify,
     pub subscribers: Mutex<Vec<Subscriber>>,
-    pub input_tx: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
-    pub dap_input_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
-    pub dap_output_tx: Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>,
-    pub dap_output_rx: Mutex<Option<mpsc::Receiver<(u64, Vec<u8>)>>>,
+    pub input_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
     pub lease: Mutex<Option<LeaseGuard>>,
     pub shutdown: CancellationToken,
     pub log: Mutex<Option<SessionLogWriter>>,
@@ -158,11 +128,12 @@ pub struct SessionHandle {
 
 impl SessionHandle {
     fn new(session: Session, log_dir: std::path::PathBuf, options_json: String) -> Self {
-        let max_bytes = if session.kind == "rtt" {
-            1024 * 1024
-        } else {
-            256 * 1024
+        let max_bytes = match session.kind.as_str() {
+            "rtt" => 1024 * 1024,
+            "dap" => 4 * 1024 * 1024,
+            _ => 256 * 1024,
         };
+        let latest_seq = session.data.latest_seq;
         let (lifecycle_tx, _) = broadcast::channel(64);
         Self {
             id: session.id.clone(),
@@ -172,13 +143,13 @@ impl SessionHandle {
             options_json,
             state: Mutex::new(session),
             ring: Mutex::new(SessionRing::new(max_bytes)),
+            sequence: AtomicU64::new(latest_seq),
+            last_timestamp_ns: AtomicU64::new(0),
+            append_lock: Mutex::new(()),
             notify: Notify::new(),
             subscriber_changed: Notify::new(),
             subscribers: Mutex::new(Vec::new()),
             input_tx: Mutex::new(None),
-            dap_input_tx: Mutex::new(None),
-            dap_output_tx: Mutex::new(None),
-            dap_output_rx: Mutex::new(None),
             lease: Mutex::new(None),
             shutdown: CancellationToken::new(),
             log: Mutex::new(None),
@@ -196,252 +167,312 @@ impl SessionHandle {
         let _ = self.lifecycle_tx.send(session);
     }
 
-    fn push_output(&self, inner: &RuntimeInner, data: Vec<u8>, channel: u8) {
-        let mut log_epoch = self.snapshot().decode.epoch;
-        let (event, decoded) = if self.kind == "rtt" {
-            let mut guard = self.decode.lock().expect("session decode");
-            if let Some(state) = guard.as_mut() {
-                let epoch = state.epoch();
-                log_epoch = epoch;
-                let chunk = state.decode(channel, &data);
-                let event = SessionEventData::RttRecords {
-                    epoch,
-                    records: chunk.records.clone(),
-                    raw: chunk.raw.clone(),
-                    error: chunk.error.clone(),
-                };
-                (event, Some(chunk))
-            } else {
-                (
-                    SessionEventData::RttRaw {
-                        epoch: log_epoch,
-                        data: data.clone(),
-                        error: None,
-                    },
-                    None,
-                )
-            }
-        } else {
-            (SessionEventData::Bytes(data.clone()), None)
-        };
-
-        let seq = {
-            let mut ring = self.ring.lock().expect("session ring");
-            ring.push(channel, event)
-        };
-        let timestamp_ms = now_unix() as u64 * 1000;
-        if let Some(log) = self.log.lock().expect("session log").as_mut() {
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms,
-                kind: RECORD_OUTPUT,
-                channel,
-                payload: data.clone(),
-            });
-            if let Some(decoded) = decoded.as_ref() {
-                let payload = serde_json::json!({
-                    "epoch": log_epoch,
-                    "records": &decoded.records,
-                    "raw": decoded.raw.as_ref().map(|raw| base64_encode(raw)),
-                    "error": &decoded.error,
-                });
-                let _ = log.append(&LogRecord {
-                    seq,
-                    timestamp_ms,
-                    kind: RECORD_DECODED,
-                    channel,
-                    payload: serde_json::to_vec(&payload).unwrap_or_default(),
-                });
-            }
-        }
-        {
-            let mut session = self.state.lock().expect("session state");
-            session.data.latest_seq = seq;
-            session.data.bytes += data.len() as u64;
-            session.data.buffered_bytes = self.ring.lock().expect("ring").bytes as u64;
-        }
-        self.notify.notify_waiters();
-        let _ = inner;
+    fn alloc_seq(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    fn push_rtt_fallback(&self, channel: u8, data: Vec<u8>, epoch: u64) {
-        let seq = {
-            let mut ring = self.ring.lock().expect("session ring");
-            ring.push(
-                channel,
-                SessionEventData::RttRaw {
-                    epoch,
-                    data: data.clone(),
-                    error: None,
-                },
-            )
-        };
-        let timestamp_ms = now_unix() as u64 * 1000;
-        if let Some(log) = self.log.lock().expect("session log").as_mut() {
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms,
-                kind: RECORD_OUTPUT,
-                channel,
-                payload: data.clone(),
-            });
-            let payload = serde_json::json!({
-                "epoch": epoch,
-                "records": Vec::<RttRecord>::new(),
-                "raw": base64_encode(&data),
-                "error": serde_json::Value::Null,
-            });
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms,
-                kind: RECORD_DECODED,
-                channel,
-                payload: serde_json::to_vec(&payload).unwrap_or_default(),
-            });
+    fn now_timestamp_ns(&self) -> u64 {
+        let now = crate::runtime::now_unix_ns();
+        let previous = self.last_timestamp_ns.fetch_max(now, Ordering::SeqCst);
+        previous.max(now)
+    }
+
+    fn event(
+        &self,
+        seq: u64,
+        timestamp_ns: u64,
+        stream: u8,
+        direction: FrameDirection,
+        record: FrameRecord,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> SessionEvent {
+        SessionEvent {
+            seq,
+            timestamp_ns,
+            stream,
+            direction,
+            record,
+            flags,
+            payload,
         }
+    }
+
+    fn log_events(&self, events: &[&SessionEvent]) {
+        let mut failed = false;
+        if let Some(log) = self.log.lock().expect("session log").as_mut() {
+            for event in events {
+                if let Err(error) = log.append(&event.header(), &event.payload) {
+                    eprintln!("session {} log write failed: {error}", self.id);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            self.mark_degraded();
+        }
+    }
+
+    fn mark_degraded(&self) {
+        self.log.lock().expect("session log").take();
         let mut session = self.state.lock().expect("session state");
+        if session.replayable {
+            session.replayable = false;
+            session.last_error = Some("persistence_failed".to_string());
+            session.updated_at = now_rfc3339();
+            let updated = session.clone();
+            drop(session);
+            let _ = self.lifecycle_tx.send(updated);
+        }
+    }
+
+    fn push_display(&self, event: SessionEvent, canonical_bytes: u64) {
+        let seq = event.seq;
+        let (buffered_bytes, evicted_through) = {
+            let mut ring = self.ring.lock().expect("session ring");
+            ring.push(event);
+            (ring.bytes as u64, ring.evicted_through)
+        };
+        let mut session = self.state.lock().expect("session state");
+        if session.data.oldest_seq == 0 {
+            session.data.oldest_seq = seq;
+        }
+        if !session.replayable && evicted_through > 0 {
+            session.data.oldest_seq = evicted_through.saturating_add(1);
+        }
         session.data.latest_seq = seq;
-        session.data.bytes += data.len() as u64;
-        session.data.buffered_bytes = self.ring.lock().expect("ring").bytes as u64;
+        session.data.bytes += canonical_bytes;
+        session.data.buffered_bytes = buffered_bytes;
+        drop(session);
         self.notify.notify_waiters();
+    }
+
+    fn emit_output(&self, stream: u8, data: Vec<u8>, decoded: Option<RttRecordsPayload>) {
+        let _append = self.append_lock.lock().expect("session append");
+        let seq = self.alloc_seq();
+        let timestamp_ns = self.now_timestamp_ns();
+        let canonical_len = data.len();
+        let display = if let Some(decoded) = decoded {
+            let payload = serde_json::to_vec(&decoded).unwrap_or_default();
+            let decoded_event = self.event(
+                seq,
+                timestamp_ns,
+                stream,
+                FrameDirection::Output,
+                FrameRecord::RttRecords,
+                0,
+                payload,
+            );
+            let raw_event = self.event(
+                seq,
+                timestamp_ns,
+                stream,
+                FrameDirection::Output,
+                FrameRecord::Data,
+                FRAME_FLAG_SUPERSEDED,
+                data,
+            );
+            self.log_events(&[&decoded_event, &raw_event]);
+            decoded_event
+        } else {
+            let raw_event = self.event(
+                seq,
+                timestamp_ns,
+                stream,
+                FrameDirection::Output,
+                FrameRecord::Data,
+                0,
+                data,
+            );
+            self.log_events(&[&raw_event]);
+            raw_event
+        };
+        self.push_display(display, canonical_len as u64);
+    }
+
+    pub fn push_output(&self, data: Vec<u8>, stream: u8) {
+        let decoded = if self.kind == "rtt" {
+            let mut guard = self.decode.lock().expect("session decode");
+            guard.as_mut().map(|state| {
+                let epoch = state.epoch();
+                let chunk = state.decode(stream, &data);
+                RttRecordsPayload {
+                    v: 1,
+                    epoch,
+                    records: chunk.records,
+                    raw_fallback: chunk.raw.map(|raw| base64_encode(&raw)),
+                    error: chunk.error,
+                }
+            })
+        } else {
+            None
+        };
+        self.emit_output(stream, data, decoded);
+    }
+
+    fn push_raw_fallback(&self, stream: u8, data: Vec<u8>) {
+        self.emit_output(stream, data, None);
     }
 
     pub fn set_decoder(&self, profile: Option<Arc<DecodeProfile>>, epoch: u64) {
-        let (old_epoch, buffers) = {
+        let buffers = {
             let mut guard = self.decode.lock().expect("session decode");
-            let old_epoch = guard.as_ref().map(DecodeState::epoch).unwrap_or(epoch);
             let buffers = guard
                 .as_mut()
                 .map(DecodeState::take_buffers)
                 .unwrap_or_default();
             *guard = profile.map(|profile| DecodeState::new(profile, epoch));
-            (old_epoch, buffers)
+            buffers
         };
-        for (channel, data) in buffers {
-            self.push_rtt_fallback(channel, data, old_epoch);
+        for (stream, data) in buffers {
+            self.push_raw_fallback(stream, data);
         }
     }
 
-    pub fn push_input(&self, data: &[u8]) {
-        let seq = {
-            let ring = self.ring.lock().expect("session ring");
-            ring.latest_seq + 1
+    pub fn push_input(&self, stream: u8, data: Vec<u8>) -> Result<(), RuntimeError> {
+        let sender = self.input_tx.lock().expect("input").clone();
+        let Some(sender) = sender else {
+            return Err(RuntimeError::new(
+                "session_closed",
+                "session is not accepting input",
+            ));
         };
-        // Input records must not advance the output cursor. Keep a separate
-        // high-water record sequence by advancing the ring's latest_seq.
-        {
-            let mut ring = self.ring.lock().expect("session ring");
-            ring.latest_seq = seq;
+        let _append = self.append_lock.lock().expect("session append");
+        let payload_len = data.len() as u64;
+        sender
+            .try_send(data.clone())
+            .map_err(|_| RuntimeError::new("input_overflow", "session input queue is full"))?;
+        let seq = self.alloc_seq();
+        let timestamp_ns = self.now_timestamp_ns();
+        let event = self.event(
+            seq,
+            timestamp_ns,
+            stream,
+            FrameDirection::Input,
+            FrameRecord::Data,
+            0,
+            data,
+        );
+        self.log_events(&[&event]);
+        let mut session = self.state.lock().expect("session state");
+        if session.data.oldest_seq == 0 {
+            session.data.oldest_seq = seq;
         }
-        if let Some(log) = self.log.lock().expect("session log").as_mut() {
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms: now_unix() as u64 * 1000,
-                kind: RECORD_INPUT,
-                channel: 0,
-                payload: data.to_vec(),
-            });
-        }
-    }
-
-    fn next_dap_seq(&self) -> u64 {
-        let mut ring = self.ring.lock().expect("session ring");
-        ring.latest_seq += 1;
-        ring.latest_seq
-    }
-
-    pub fn push_dap_output(&self, data: Vec<u8>) {
-        let seq = self.next_dap_seq();
-        let timestamp_ms = now_unix() as u64 * 1000;
-        if let Some(log) = self.log.lock().expect("session log").as_mut() {
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms,
-                kind: RECORD_OUTPUT,
-                channel: 0,
-                payload: data.clone(),
-            });
-        }
-        {
-            let mut session = self.state.lock().expect("session state");
-            session.data.latest_seq = seq;
-            session.data.bytes += data.len() as u64;
-        }
-        if let Some(tx) = self.dap_output_tx.lock().expect("dap output").as_ref() {
-            let _ = tx.try_send((seq, data));
-        }
-    }
-
-    pub fn push_dap_input(&self, data: Vec<u8>) {
-        let seq = self.next_dap_seq();
-        let timestamp_ms = now_unix() as u64 * 1000;
-        if let Some(log) = self.log.lock().expect("session log").as_mut() {
-            let _ = log.append(&LogRecord {
-                seq,
-                timestamp_ms,
-                kind: RECORD_INPUT,
-                channel: 1,
-                payload: data.clone(),
-            });
-        }
-        {
-            let mut session = self.state.lock().expect("session state");
-            session.data.latest_seq = seq;
-            session.data.bytes += data.len() as u64;
-        }
-        if let Some(tx) = self.dap_input_tx.lock().expect("dap input").as_ref() {
-            let _ = tx.try_send(data);
-        }
+        session.data.latest_seq = seq;
+        session.data.input_bytes += payload_len;
+        Ok(())
     }
 
     pub fn replay(&self, after: u64, include_input: bool) -> Vec<SessionEvent> {
-        let log_path = session_log::session_log_path(&self.log_dir, &self.id);
-        let records = session_log::read_records(&log_path).unwrap_or_default();
-        let mut decoded = HashMap::new();
-        for record in &records {
-            if record.kind == RECORD_DECODED {
-                if let Ok(payload) = serde_json::from_slice::<DecodedPayload>(&record.payload) {
-                    decoded.insert(record.seq, payload);
-                }
-            }
+        let path = session_log::session_log_path(&self.log_dir, &self.id);
+        let Some(mut reader) = SessionLogReader::open(&path).unwrap_or(None) else {
+            return Vec::new();
+        };
+        if reader.header().session_id != self.id || reader.header().kind != self.kind {
+            return Vec::new();
         }
         let mut out = Vec::new();
-        for record in records {
-            if record.seq <= after {
-                continue;
-            }
-            let data = match record.kind {
-                RECORD_INPUT if include_input => Some(SessionEventData::Input(record.payload)),
-                RECORD_INPUT => None,
-                RECORD_OUTPUT if self.kind == "rtt" => {
-                    if let Some(payload) = decoded.remove(&record.seq) {
-                        Some(SessionEventData::RttRecords {
-                            epoch: payload.epoch,
-                            records: payload.records,
-                            raw: payload.raw.and_then(|raw| base64_decode(&raw)),
-                            error: payload.error,
-                        })
-                    } else {
-                        Some(SessionEventData::RttRaw {
-                            epoch: 0,
-                            data: record.payload,
-                            error: None,
-                        })
+        let mut displayed = HashSet::new();
+        loop {
+            match reader.next_frame() {
+                session_log::NextFrame::Frame(frame) => {
+                    if frame.header.seq <= after {
+                        continue;
+                    }
+                    let include = match frame.header.record {
+                        FrameRecord::SessionHeader => false,
+                        FrameRecord::Data if frame.header.direction == FrameDirection::Input => {
+                            include_input
+                        }
+                        FrameRecord::Data
+                            if frame.header.flags & FRAME_FLAG_SUPERSEDED != 0
+                                && displayed.contains(&frame.header.seq) =>
+                        {
+                            false
+                        }
+                        FrameRecord::Data | FrameRecord::RttRecords => {
+                            displayed.insert(frame.header.seq);
+                            true
+                        }
+                        FrameRecord::Gap | FrameRecord::Mark => true,
+                    };
+                    if include {
+                        out.push(SessionEvent {
+                            seq: frame.header.seq,
+                            timestamp_ns: frame.header.timestamp_ns,
+                            stream: frame.header.stream,
+                            direction: frame.header.direction,
+                            record: frame.header.record,
+                            flags: frame.header.flags,
+                            payload: frame.payload,
+                        });
                     }
                 }
-                RECORD_OUTPUT => Some(SessionEventData::Bytes(record.payload)),
-                _ => None,
-            };
-            if let Some(data) = data {
-                out.push(SessionEvent {
-                    seq: record.seq,
-                    channel: record.channel,
-                    timestamp_ms: record.timestamp_ms,
-                    data,
-                });
+                session_log::NextFrame::End => break,
+                session_log::NextFrame::Truncated { .. }
+                | session_log::NextFrame::Corrupt { .. } => break,
             }
         }
         out
+    }
+
+    pub fn log_mark(&self, event: &str, detail: serde_json::Value) -> u64 {
+        let _append = self.append_lock.lock().expect("session append");
+        let seq = self.alloc_seq();
+        let timestamp_ns = self.now_timestamp_ns();
+        let payload = serde_json::to_vec(&MarkPayload::new(event, detail)).unwrap_or_default();
+        let mark = self.event(
+            seq,
+            timestamp_ns,
+            0,
+            FrameDirection::Output,
+            FrameRecord::Mark,
+            0,
+            payload,
+        );
+        self.log_events(&[&mark]);
+        let mut session = self.state.lock().expect("session state");
+        if session.data.oldest_seq == 0 {
+            session.data.oldest_seq = seq;
+        }
+        session.data.latest_seq = seq;
+        seq
+    }
+
+    pub fn log_decode_mark(&self, decode: &SessionDecode) -> u64 {
+        self.log_mark(
+            "session.decoder",
+            serde_json::to_value(decode).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    pub fn log_gap(&self, from_seq: u64, to_seq: u64, dropped_bytes: u64) -> u64 {
+        let _append = self.append_lock.lock().expect("session append");
+        let seq = self.alloc_seq();
+        let timestamp_ns = self.now_timestamp_ns();
+        let gap = self.event(
+            seq,
+            timestamp_ns,
+            0,
+            FrameDirection::Output,
+            FrameRecord::Gap,
+            0,
+            GapPayload {
+                from_seq,
+                to_seq,
+                dropped_bytes,
+            }
+            .encode()
+            .to_vec(),
+        );
+        self.log_events(&[&gap]);
+        let mut session = self.state.lock().expect("session state");
+        if session.data.oldest_seq == 0 {
+            session.data.oldest_seq = seq;
+        }
+        session.data.latest_seq = seq;
+        seq
     }
 
     pub fn attach(&self, principal: &str, mode: &str) -> Result<Subscriber, RuntimeError> {
@@ -478,6 +509,10 @@ impl SessionHandle {
 
     pub fn read_after(&self, cursor: u64) -> Vec<SessionEvent> {
         self.ring.lock().expect("session ring").after(cursor)
+    }
+
+    pub fn ring_evicted_through(&self) -> u64 {
+        self.ring.lock().expect("session ring").evicted_through
     }
 
     pub fn detach(&self, subscriber_id: &str) {
@@ -687,7 +722,7 @@ impl Runtime {
             }
         };
         let now = now_rfc3339();
-        let session = Session {
+        let mut session = Session {
             id: id.clone(),
             kind: kind.to_string(),
             resource_id: resource_id.to_string(),
@@ -720,10 +755,20 @@ impl Runtime {
             options_json,
         ));
         *handle.lease.lock().expect("lease") = Some(lease);
-        let log = SessionLogWriter::open(&self.inner.config.session_dir, &id)
-            .map_err(|error| RuntimeError::internal(error.to_string()))?;
+        let log = SessionLogWriter::open(
+            &self.inner.config.session_dir,
+            &id,
+            kind,
+            crate::runtime::now_unix_ns(),
+        )
+        .map_err(|error| RuntimeError::internal(error.to_string()))?;
         *handle.log.lock().expect("log") = Some(log);
         handle.set_decoder(profile.clone(), decode.epoch);
+        if session.decode.artifact.is_some() {
+            handle.log_decode_mark(&session.decode);
+            session.data = handle.snapshot().data;
+            handle.update(session.clone());
+        }
         self.inner
             .sessions
             .lock()
@@ -1027,6 +1072,8 @@ impl Runtime {
         session.updated_at = now_rfc3339();
         handle.set_decoder(Some(profile), session.decode.epoch);
         handle.update(session.clone());
+        handle.log_decode_mark(&session.decode);
+        session.data = handle.snapshot().data;
         self.persist_session(&session).await?;
         Ok(session)
     }
@@ -1071,6 +1118,8 @@ impl Runtime {
         session.updated_at = now_rfc3339();
         handle.set_decoder(None, session.decode.epoch);
         handle.update(session.clone());
+        handle.log_decode_mark(&session.decode);
+        session.data = handle.snapshot().data;
         self.persist_session(&session).await?;
         Ok(session)
     }
@@ -1084,6 +1133,8 @@ impl Runtime {
         session.updated_at = now_rfc3339();
         handle.set_decoder(None, session.decode.epoch);
         handle.update(session.clone());
+        handle.log_mark("session.closed", serde_json::json!({}));
+        session.data = handle.snapshot().data;
         self.inner
             .store
             .remove_artifact_refs_for_owner("session", id)
@@ -1091,8 +1142,16 @@ impl Runtime {
         self.persist_session(&session).await?;
         if purge {
             self.inner.store.purge_session_data(id).await?;
-            let path = session_log::session_log_path(&self.inner.config.session_dir, id);
-            let _ = std::fs::remove_file(path);
+            let directory = self.inner.config.session_dir.join(id);
+            if let Ok(entries) = std::fs::read_dir(&directory) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with("session.log") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&directory);
             self.inner
                 .sessions
                 .lock()
@@ -1154,6 +1213,11 @@ impl Runtime {
         }
         handle.update(session.clone());
         handle.set_decoder(profile, session.decode.epoch);
+        handle.log_mark("session.resumed", serde_json::json!({}));
+        if session.decode.artifact.is_some() {
+            handle.log_decode_mark(&session.decode);
+        }
+        session.data = handle.snapshot().data;
         let _ = persist_session_record(&self.inner, &session, &handle.options_json).await;
         *handle.lease.lock().expect("lease") = Some(lease);
         let options = serde_json::from_str::<boot_protocol::SessionOptions>(&handle.options_json)
@@ -1185,7 +1249,82 @@ impl Runtime {
         let records = inner.store.load_sessions().await?;
         for record in records {
             let path = session_log::session_log_path(&inner.config.session_dir, &record.id);
-            let latest = session_log::latest_seq(&path);
+            let scan = match session_log::scan(&path) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!("session {} log is unreadable: {error}", record.id);
+                    let corrupt = path.with_file_name(format!(
+                        "session.log.corrupt-{}",
+                        crate::runtime::now_unix()
+                    ));
+                    let _ = std::fs::rename(&path, corrupt);
+                    session_log::LogScan {
+                        header: None,
+                        first_seq: 0,
+                        latest_seq: 0,
+                        input_bytes: 0,
+                        last_good_offset: 0,
+                        problem: Some(session_log::LogProblem::Corrupt {
+                            offset: 0,
+                            message: error.to_string(),
+                        }),
+                    }
+                }
+            };
+            let mut log_corrupt = false;
+            match &scan.problem {
+                Some(session_log::LogProblem::Truncated { offset }) => {
+                    eprintln!(
+                        "session {} log is truncated at offset {}; truncating to {}",
+                        record.id, offset, scan.last_good_offset
+                    );
+                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                        let _ = file.set_len(scan.last_good_offset);
+                    }
+                }
+                Some(session_log::LogProblem::Corrupt { offset, message }) => {
+                    eprintln!(
+                        "session {} log is corrupt at offset {}: {}",
+                        record.id, offset, message
+                    );
+                    log_corrupt = true;
+                    let corrupt = path.with_file_name(format!(
+                        "session.log.corrupt-{}",
+                        crate::runtime::now_unix()
+                    ));
+                    let _ = std::fs::rename(&path, corrupt);
+                }
+                None => {}
+            }
+            let header_matches = scan
+                .header
+                .as_ref()
+                .is_none_or(|header| header.session_id == record.id && header.kind == record.kind);
+            let log_missing = scan.header.is_none();
+            let latest = scan.latest_seq.max(record.latest_seq as u64);
+            let oldest = if log_corrupt {
+                latest.saturating_add(1)
+            } else if scan.first_seq > 0 {
+                scan.first_seq
+            } else {
+                record.first_seq as u64
+            };
+            let replayable = record.replayable != 0
+                && header_matches
+                && !log_corrupt
+                && !(log_missing && record.latest_seq > 0);
+            let lost_all = log_corrupt || (log_missing && record.latest_seq > 0);
+            let gap_range = if lost_all {
+                Some(((record.first_seq.max(1)) as u64, latest))
+            } else if matches!(
+                scan.problem,
+                Some(session_log::LogProblem::Truncated { .. })
+            ) && (record.latest_seq as u64) > scan.latest_seq
+            {
+                Some((scan.latest_seq.saturating_add(1), record.latest_seq as u64))
+            } else {
+                None
+            };
             let mut session = Session {
                 id: record.id.clone(),
                 kind: record.kind.clone(),
@@ -1199,12 +1338,13 @@ impl Runtime {
                 max_subscribers: record.max_subscribers as u32,
                 detach_timeout_seconds: record.detach_timeout_seconds as u64,
                 resume_count: record.resume_count as u64,
-                replayable: record.replayable != 0,
+                replayable,
                 data: SessionData {
-                    oldest_seq: record.first_seq as u64,
-                    latest_seq: latest.max(record.latest_seq as u64),
+                    oldest_seq: oldest,
+                    latest_seq: latest,
                     buffered_bytes: 0,
                     bytes: record.data_bytes as u64,
+                    input_bytes: scan.input_bytes,
                 },
                 decode: serde_json::from_str(&record.decode_json).unwrap_or_default(),
                 last_error: record.last_error,
@@ -1223,8 +1363,41 @@ impl Runtime {
                 inner.config.session_dir.clone(),
                 record.options_json.clone(),
             ));
-            if let Ok(log) = SessionLogWriter::open(&inner.config.session_dir, &session.id) {
-                *handle.log.lock().expect("log") = Some(log);
+            let created_at_ns = (record.created_at as u64).saturating_mul(1_000_000_000);
+            match SessionLogWriter::open(
+                &inner.config.session_dir,
+                &session.id,
+                &session.kind,
+                created_at_ns,
+            ) {
+                Ok(log) => {
+                    *handle.log.lock().expect("log") = Some(log);
+                    if let Some((from_seq, to_seq)) = gap_range
+                        && from_seq <= to_seq
+                    {
+                        let dropped_bytes = if lost_all {
+                            record.data_bytes as u64
+                        } else {
+                            0
+                        };
+                        let gap_seq = handle.log_gap(from_seq, to_seq, dropped_bytes);
+                        if lost_all {
+                            session.data.oldest_seq = gap_seq;
+                            session.data.input_bytes = 0;
+                            if !matches!(session.state.as_str(), "closed" | "failed") {
+                                session.replayable = true;
+                            }
+                        }
+                        session.data.latest_seq = gap_seq;
+                        handle.update(session.clone());
+                    }
+                }
+                Err(error) => {
+                    eprintln!("session {} log is unreadable: {error}", session.id);
+                    let mut state = handle.state.lock().expect("session state");
+                    state.replayable = false;
+                    state.last_error = Some("session_log_unreadable".to_string());
+                }
             }
             inner
                 .sessions
@@ -1259,6 +1432,8 @@ pub fn schedule_close_if_idle(inner: Arc<RuntimeInner>, handle: Arc<SessionHandl
         session.updated_at = now_rfc3339();
         handle.set_decoder(None, session.decode.epoch);
         handle.update(session.clone());
+        handle.log_mark("session.closed", serde_json::json!({}));
+        session.data = handle.snapshot().data;
         handle.shutdown.cancel();
         let _ = handle.lease.lock().expect("lease").take();
         let _ = inner
@@ -1269,7 +1444,7 @@ pub fn schedule_close_if_idle(inner: Arc<RuntimeInner>, handle: Arc<SessionHandl
     });
 }
 
-async fn fail_session(inner: &RuntimeInner, handle: &SessionHandle, error: String) {
+pub(crate) async fn fail_session(inner: &RuntimeInner, handle: &SessionHandle, error: String) {
     let mut session = handle.snapshot();
     session.state = if session.kind == "dap" {
         "failed".to_string()
@@ -1280,6 +1455,16 @@ async fn fail_session(inner: &RuntimeInner, handle: &SessionHandle, error: Strin
     session.updated_at = now_rfc3339();
     handle.update(session.clone());
     handle.set_decoder(None, session.decode.epoch);
+    let event = if session.kind == "dap" {
+        "session.failed"
+    } else {
+        "session.suspended"
+    };
+    handle.log_mark(
+        event,
+        serde_json::json!({"error": session.last_error.clone()}),
+    );
+    session.data = handle.snapshot().data;
     let _ = handle.lease.lock().expect("lease").take();
     let _ = persist_session_record(inner, &session, &handle.options_json).await;
     handle.shutdown.cancel();
@@ -1296,6 +1481,8 @@ pub async fn close_dap_session(
     session.updated_at = now_rfc3339();
     handle.set_decoder(None, session.decode.epoch);
     handle.update(session.clone());
+    handle.log_mark("session.closed", serde_json::json!({}));
+    session.data = handle.snapshot().data;
     let _ = handle.lease.lock().expect("lease").take();
     let _ = inner
         .store
@@ -1316,7 +1503,7 @@ fn spawn_session_thread(
     let shutdown = handle.shutdown.clone();
     let kind = handle.kind.clone();
     if kind == "serial" {
-        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
         *handle.input_tx.lock().expect("input") = Some(input_tx);
         let Some(path) = path else {
             let handle = handle.clone();
@@ -1355,11 +1542,8 @@ fn spawn_session_thread(
                 return;
             };
             let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-            let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(256);
             let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-            *handle.dap_input_tx.lock().expect("dap input") = Some(input_tx);
-            *handle.dap_output_tx.lock().expect("dap output") = Some(subscriber_tx);
-            *handle.dap_output_rx.lock().expect("dap output") = Some(subscriber_rx);
+            *handle.input_tx.lock().expect("input") = Some(input_tx);
             let resolver = std::sync::Arc::new(RuntimeArtifactResolver {
                 inner: inner.clone(),
             });
@@ -1403,7 +1587,7 @@ fn spawn_session_thread(
                     tokio::select! {
                         data = worker_rx.recv() => {
                             if let Some(data) = data {
-                                handle_for_task.push_dap_output(data);
+                                handle_for_task.push_output(data, 0);
                             }
                         }
                         event = event_rx.recv() => {
@@ -1457,14 +1641,16 @@ async fn process_thread_event(
             session.state = "active".to_string();
             session.updated_at = now_rfc3339();
             handle.update(session.clone());
+            handle.log_mark("session.active", serde_json::json!({}));
+            session.data = handle.snapshot().data;
             let _ = persist_session_record(inner, &session, &handle.options_json).await;
             if session.subscribers == 0 && session.kind != "dap" {
                 schedule_close_if_idle(inner.clone(), handle.clone());
             }
             true
         }
-        ThreadEvent::Data { data, channel } => {
-            handle.push_output(inner, data, channel);
+        ThreadEvent::Data { data, stream } => {
+            handle.push_output(data, stream);
             true
         }
         ThreadEvent::Error(error) => {
@@ -1478,6 +1664,8 @@ async fn process_thread_event(
             session.updated_at = now_rfc3339();
             handle.set_decoder(None, session.decode.epoch);
             handle.update(session.clone());
+            handle.log_mark("session.closed", serde_json::json!({}));
+            session.data = handle.snapshot().data;
             let _ = handle.lease.lock().expect("lease").take();
             let _ = inner
                 .store
@@ -1520,7 +1708,7 @@ fn serial_thread(
             Ok(n) if n > 0 => {
                 let _ = event_tx.send(ThreadEvent::Data {
                     data: buffer[..n].to_vec(),
-                    channel: 0,
+                    stream: 0,
                 });
             }
             Ok(_) => {}
@@ -1616,7 +1804,7 @@ fn rtt_thread(
                     any = true;
                     let _ = event_tx.send(ThreadEvent::Data {
                         data: buffer[..count].to_vec(),
-                        channel: channel as u8,
+                        stream: channel as u8,
                     });
                 }
                 Ok(_) => {}
@@ -1638,29 +1826,85 @@ fn base64_encode(data: &[u8]) -> String {
     base64::prelude::BASE64_STANDARD.encode(data)
 }
 
-fn base64_decode(data: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    base64::prelude::BASE64_STANDARD.decode(data).ok()
-}
-
 // Keep the public constant accessible for handlers.
 pub const _MAX_SESSION_LIFETIME: Duration = Duration::from_secs(8 * 3600);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boot_protocol::{RttRecord, SESSION_FRAME_HEADER_LEN};
+
+    fn test_session(kind: &str) -> Session {
+        Session {
+            id: format!("ses_{kind}"),
+            kind: kind.into(),
+            resource_id: "probe_test".into(),
+            created_by: "principal".into(),
+            state: "active".into(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            closed_at: None,
+            subscribers: 0,
+            max_subscribers: 8,
+            detach_timeout_seconds: 60,
+            resume_count: 0,
+            replayable: true,
+            data: SessionData::default(),
+            decode: SessionDecode::default(),
+            last_error: None,
+        }
+    }
+
+    fn test_event(
+        seq: u64,
+        record: FrameRecord,
+        direction: FrameDirection,
+        payload: &[u8],
+    ) -> SessionEvent {
+        SessionEvent {
+            seq,
+            timestamp_ns: seq * 1_000,
+            stream: 0,
+            direction,
+            record,
+            flags: 0,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn log_header(seq: u64, record: FrameRecord, flags: u8) -> SessionFrameHeader {
+        SessionFrameHeader {
+            flags,
+            record,
+            direction: FrameDirection::Output,
+            stream: 0,
+            seq,
+            timestamp_ns: seq * 1_000,
+        }
+    }
 
     #[test]
     fn live_ring_evicts_oldest_and_preserves_cursor_order() {
-        let mut ring = SessionRing::new(100);
-        assert_eq!(ring.push(0, SessionEventData::Bytes(b"abc".to_vec())), 1);
-        assert_eq!(ring.push(0, SessionEventData::Bytes(b"def".to_vec())), 2);
+        let mut ring = SessionRing::new(SESSION_FRAME_HEADER_LEN + 10);
+        ring.push(test_event(
+            1,
+            FrameRecord::Data,
+            FrameDirection::Output,
+            b"abc",
+        ));
+        ring.push(test_event(
+            2,
+            FrameRecord::Data,
+            FrameDirection::Output,
+            b"def",
+        ));
         // The first chunk is evicted to keep the live tail bounded.
         assert_eq!(ring.after(0).len(), 1);
         assert_eq!(ring.after(0)[0].seq, 2);
         assert_eq!(ring.after(1).len(), 1);
         assert_eq!(ring.after(1)[0].seq, 2);
         assert!(ring.after(2).is_empty());
+        assert_eq!(ring.evicted_through, 1);
     }
 
     #[tokio::test]
@@ -1738,34 +1982,25 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        let session = Session {
-            id: "ses_dap".into(),
-            kind: "dap".into(),
-            resource_id: "probe_test".into(),
-            created_by: "principal".into(),
-            state: "active".into(),
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-            closed_at: None,
-            subscribers: 0,
-            max_subscribers: 1,
-            detach_timeout_seconds: 0,
-            resume_count: 0,
-            replayable: true,
-            data: SessionData::default(),
-            decode: SessionDecode::default(),
-            last_error: None,
-        };
-        let handle = SessionHandle::new(session, directory.clone(), "{}".into());
-        let writer = SessionLogWriter::open(&directory, "ses_dap").unwrap();
+        let handle = SessionHandle::new(test_session("dap"), directory.clone(), "{}".into());
+        let writer = SessionLogWriter::open(&directory, "ses_dap", "dap", 1).unwrap();
         *handle.log.lock().expect("log") = Some(writer);
-        handle.push_dap_input(b"request".to_vec());
-        handle.push_dap_output(b"response".to_vec());
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        *handle.input_tx.lock().expect("input") = Some(tx);
+
+        handle.push_input(0, b"request".to_vec()).unwrap();
+        handle.push_output(b"response".to_vec(), 0);
+        drop(rx);
+
         let events = handle.replay(0, true);
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].data, SessionEventData::Input(ref data) if data == b"request"));
-        assert!(matches!(events[1].data, SessionEventData::Bytes(ref data) if data == b"response"));
-        assert_eq!(handle.snapshot().data.bytes, 15);
+        assert_eq!(events[0].record, FrameRecord::Data);
+        assert_eq!(events[0].direction, FrameDirection::Input);
+        assert_eq!(events[0].payload, b"request");
+        assert_eq!(events[1].direction, FrameDirection::Output);
+        assert_eq!(events[1].payload, b"response");
+        assert_eq!(handle.snapshot().data.bytes, 8);
+        assert_eq!(handle.snapshot().data.input_bytes, 7);
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -1777,76 +2012,65 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        let session = Session {
-            id: "ses_test".into(),
-            kind: "rtt".into(),
-            resource_id: "probe_test".into(),
-            created_by: "principal".into(),
-            state: "closed".into(),
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-            closed_at: Some(now_rfc3339()),
-            subscribers: 0,
-            max_subscribers: 8,
-            detach_timeout_seconds: 60,
-            resume_count: 0,
-            replayable: true,
-            data: SessionData::default(),
-            decode: SessionDecode::default(),
-            last_error: None,
+        let handle = SessionHandle::new(test_session("rtt"), directory.clone(), "{}".into());
+        let path = session_log::session_log_path(&directory, "ses_rtt");
+        let mut writer = SessionLogWriter::open(&directory, "ses_rtt", "rtt", 1).unwrap();
+        let empty = RttRecordsPayload {
+            v: 1,
+            epoch: 1,
+            records: Vec::new(),
+            raw_fallback: None,
+            error: None,
         };
-        let handle = SessionHandle::new(session, directory.clone(), "{}".into());
-        let path = session_log::session_log_path(&directory, "ses_test");
-        let mut writer = SessionLogWriter::open(&directory, "ses_test").unwrap();
         writer
-            .append(&LogRecord {
-                seq: 1,
-                timestamp_ms: 1,
-                kind: RECORD_OUTPUT,
-                channel: 0,
-                payload: b"partial".to_vec(),
-            })
+            .append(
+                &log_header(1, FrameRecord::RttRecords, 0),
+                &serde_json::to_vec(&empty).unwrap(),
+            )
             .unwrap();
         writer
-            .append(&LogRecord {
-                seq: 1,
-                timestamp_ms: 1,
-                kind: RECORD_DECODED,
-                channel: 0,
-                payload: br#"{"epoch":1,"records":[],"raw":null,"error":null}"#.to_vec(),
-            })
+            .append(
+                &log_header(1, FrameRecord::Data, FRAME_FLAG_SUPERSEDED),
+                b"partial",
+            )
+            .unwrap();
+        let one = RttRecordsPayload {
+            v: 1,
+            epoch: 1,
+            records: vec![RttRecord {
+                timestamp: None,
+                level: Some("info".into()),
+                module: None,
+                file: None,
+                line: None,
+                message: "hello".into(),
+            }],
+            raw_fallback: None,
+            error: None,
+        };
+        writer
+            .append(
+                &log_header(2, FrameRecord::RttRecords, 0),
+                &serde_json::to_vec(&one).unwrap(),
+            )
             .unwrap();
         writer
-            .append(&LogRecord {
-                seq: 2,
-                timestamp_ms: 2,
-                kind: RECORD_OUTPUT,
-                channel: 0,
-                payload: b"frame".to_vec(),
-            })
-            .unwrap();
-        writer
-            .append(&LogRecord {
-                seq: 2,
-                timestamp_ms: 2,
-                kind: RECORD_DECODED,
-                channel: 0,
-                payload: br#"{"epoch":1,"records":[{"timestamp":null,"level":"info","module":null,"file":null,"line":null,"message":"hello"}],"raw":null,"error":null}"#.to_vec(),
-            })
+            .append(
+                &log_header(2, FrameRecord::Data, FRAME_FLAG_SUPERSEDED),
+                b"frame",
+            )
             .unwrap();
         drop(writer);
+
         let events = handle.replay(0, false);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].seq, 1);
-        assert!(matches!(
-            events[0].data,
-            SessionEventData::RttRecords { ref records, .. } if records.is_empty()
-        ));
+        assert_eq!(events[0].record, FrameRecord::RttRecords);
+        let first: RttRecordsPayload = serde_json::from_slice(&events[0].payload).unwrap();
+        assert!(first.records.is_empty());
         assert_eq!(events[1].seq, 2);
-        assert!(matches!(
-            events[1].data,
-            SessionEventData::RttRecords { ref records, .. } if records.len() == 1
-        ));
+        let second: RttRecordsPayload = serde_json::from_slice(&events[1].payload).unwrap();
+        assert_eq!(second.records.len(), 1);
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
